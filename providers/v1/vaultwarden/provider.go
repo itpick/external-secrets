@@ -28,6 +28,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -55,6 +57,9 @@ func (p *Provider) NewClient(ctx context.Context, store esv1.GenericStore, kube 
 	if err != nil {
 		return nil, err
 	}
+	if err := validateURL(prov.URL); err != nil {
+		return nil, err
+	}
 	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
 	caBytes, err := esutils.FetchCACertFromSource(ctx, esutils.CreateCertOpts{
 		CABundle:   prov.CABundle,
@@ -75,7 +80,11 @@ func (p *Provider) NewClient(ctx context.Context, store esv1.GenericStore, kube 
 	}
 	httpClient := &http.Client{
 		Timeout: 30 * time.Second,
+		// Never follow redirects: a 307/308 would re-send the token request's
+		// client_secret (or a same-host bearer token) to the redirect target.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		Transport: &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
 			TLSClientConfig:       tlsConfig,
 			TLSHandshakeTimeout:   10 * time.Second,
 			ResponseHeaderTimeout: 15 * time.Second,
@@ -101,11 +110,21 @@ func (p *Provider) ValidateStore(store esv1.GenericStore) (admission.Warnings, e
 		return nil, errors.New(errUnexpectedStoreSpec)
 	}
 	vw := spc.Provider.Vaultwarden
+	if err := validateURL(vw.URL); err != nil {
+		return nil, err
+	}
 	if vw.OrganizationID != "" && vw.OrganizationName != "" {
 		return nil, errors.New("vaultwarden: organizationId and organizationName are mutually exclusive; set at most one")
 	}
-	orgScoped := vw.OrganizationID != "" || vw.OrganizationName != ""
 	var warnings admission.Warnings
+	if vw.OrganizationName != "" {
+		if strings.TrimSpace(vw.OrganizationName) == "" {
+			return nil, errors.New("vaultwarden: organizationName must not be blank")
+		}
+		warnings = append(warnings, "vaultwarden: organizationName is resolved by display name, which organization admins can "+
+			"rename or duplicate; prefer organizationId for production stores")
+	}
+	orgScoped := vw.OrganizationID != "" || vw.OrganizationName != ""
 	switch {
 	case vw.OrganizationKeyFingerprint != "" && !orgScoped:
 		return nil, errors.New("vaultwarden: organizationKeyFingerprint requires organizationId or organizationName")
@@ -120,16 +139,29 @@ func (p *Provider) ValidateStore(store esv1.GenericStore) (admission.Warnings, e
 	return warnings, nil
 }
 
+// validateURL accepts only absolute https:// URLs without embedded credentials:
+// the provider sends the API key and bearer tokens to this URL.
+func validateURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil {
+		return errors.New("vaultwarden: url must be an absolute https:// URL without credentials")
+	}
+	return nil
+}
+
+// NewProvider returns a new Vaultwarden provider.
 func NewProvider() esv1.Provider {
 	return &Provider{}
 }
 
+// ProviderSpec returns an empty Vaultwarden provider spec for registration.
 func ProviderSpec() *esv1.SecretStoreProvider {
 	return &esv1.SecretStoreProvider{
 		Vaultwarden: &esv1.VaultwardenProvider{},
 	}
 }
 
+// MaintenanceStatus returns the maintenance status of the provider.
 func MaintenanceStatus() esv1.MaintenanceStatus {
 	return esv1.MaintenanceStatusMaintained
 }

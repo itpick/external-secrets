@@ -29,6 +29,7 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -545,4 +546,104 @@ func TestGetSecretNotFoundIsNoSecretErr(t *testing.T) {
 	assert.ErrorIs(t, err, esv1.NoSecretErr)
 	_, err = c.GetSecretMap(context.Background(), esv1.ExternalSecretDataRemoteRef{Key: "missing"})
 	assert.ErrorIs(t, err, esv1.NoSecretErr)
+}
+
+// L6: only absolute https:// URLs are accepted.
+func TestValidateStoreRequiresHTTPS(t *testing.T) {
+	p := &Provider{}
+	for _, u := range []string{"", "http://vw.example.com", "vw.example.com", "ftp://vw.example.com", "https://", "https://user:pw@vw.example.com"} {
+		_, err := p.ValidateStore(newStore(&esv1.VaultwardenProvider{URL: u}))
+		assert.Error(t, err, "url %q", u)
+	}
+	_, err := p.ValidateStore(newStore(&esv1.VaultwardenProvider{URL: "https://vw.example.com/base"}))
+	assert.NoError(t, err)
+}
+
+// L4/L6: organizationName must not be blank, and using it draws a warning
+// recommending organizationId.
+func TestValidateStoreOrganizationName(t *testing.T) {
+	p := &Provider{}
+	_, err := p.ValidateStore(newStore(&esv1.VaultwardenProvider{URL: "https://vw.example.com", OrganizationName: "   "}))
+	assert.Error(t, err)
+	w, err := p.ValidateStore(newStore(&esv1.VaultwardenProvider{URL: "https://vw.example.com", OrganizationName: "Example"}))
+	require.NoError(t, err)
+	assert.True(t, containsSubstring(w, "organizationId"), "warnings: %v", w)
+	w, err = p.ValidateStore(newStore(&esv1.VaultwardenProvider{URL: "https://vw.example.com", OrganizationID: testOrgID}))
+	require.NoError(t, err)
+	assert.False(t, containsSubstring(w, "organizationName"), "warnings: %v", w)
+}
+
+// L6: the production HTTP client must not follow redirects: a 307 from the
+// token endpoint would re-send client_id/client_secret to the redirect target.
+func TestTokenRequestDoesNotFollowRedirects(t *testing.T) {
+	var mu sync.Mutex
+	var leaked []string
+	srvB := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		mu.Lock()
+		leaked = append(leaked, r.Method+" "+r.URL.Path+" "+r.Form.Encode())
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"stolen"}`))
+	}))
+	defer srvB.Close()
+	srvA := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, srvB.URL+"/steal"+r.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	defer srvA.Close()
+
+	scheme := k8sruntime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	kube := clientfake.NewClientBuilder().WithScheme(scheme).WithObjects(hostileCredsKube(t)).Build()
+	prov := esv1.VaultwardenProvider{
+		URL:      srvA.URL,
+		CABundle: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srvA.Certificate().Raw}),
+		Auth: esv1.VaultwardenAuth{SecretRef: esv1.VaultwardenSecretRef{
+			ClientID:       esmeta.SecretKeySelector{Name: "vw", Key: "clientID"},
+			ClientSecret:   esmeta.SecretKeySelector{Name: "vw", Key: "clientSecret"},
+			MasterPassword: esmeta.SecretKeySelector{Name: "vw", Key: "masterPassword"},
+		}},
+	}
+	store := &esv1.SecretStore{Kind: esv1.SecretStoreKind, Name: "vw-store", Namespace: "default",
+		Spec: esv1.SecretStoreSpec{Provider: &esv1.SecretStoreProvider{Vaultwarden: &prov}}}
+	sc, err := (&Provider{}).NewClient(context.Background(), store, kube, "default")
+	require.NoError(t, err)
+	c := sc.(*Client)
+
+	_, err = c.getToken(context.Background())
+	require.Error(t, err)
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Empty(t, leaked, "credentials followed a redirect")
+}
+
+// L6: NewClient refuses a non-https URL even if admission was bypassed.
+func TestNewClientRequiresHTTPS(t *testing.T) {
+	store := newStore(&esv1.VaultwardenProvider{URL: "http://vw.example.com"})
+	_, err := (&Provider{}).NewClient(context.Background(), store, nil, "default")
+	assert.Error(t, err)
+}
+
+type idleSpyTransport struct {
+	http.RoundTripper
+	closed bool
+}
+
+func (s *idleSpyTransport) CloseIdleConnections() { s.closed = true }
+
+// Info: the transport honours proxy settings and Close releases idle connections.
+func TestHTTPClientHygiene(t *testing.T) {
+	store := newStore(&esv1.VaultwardenProvider{URL: "https://vw.example.com"})
+	sc, err := (&Provider{}).NewClient(context.Background(), store, nil, "default")
+	require.NoError(t, err)
+	c := sc.(*Client)
+	tr, ok := c.httpClient.Transport.(*http.Transport)
+	require.True(t, ok)
+	assert.NotNil(t, tr.Proxy)
+	assert.NotNil(t, c.httpClient.CheckRedirect)
+
+	spy := &idleSpyTransport{RoundTripper: tr}
+	c.httpClient.Transport = spy
+	require.NoError(t, c.Close(context.Background()))
+	assert.True(t, spy.closed)
 }

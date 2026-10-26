@@ -22,12 +22,14 @@ import (
 
 // VaultwardenProvider configures a store to sync secrets with a self-hosted Vaultwarden instance.
 type VaultwardenProvider struct {
-	// URL is the base URL of the Vaultwarden instance, e.g. https://vault.example.com
+	// URL is the base URL of the Vaultwarden instance, e.g. https://vault.example.com.
+	// Only https:// URLs are accepted (enforced by the webhook and the provider).
 	URL string `json:"url"`
 	// Auth configures how ESO authenticates with Vaultwarden using a personal API key.
 	Auth VaultwardenAuth `json:"auth"`
 	// OrganizationID, if set, scopes this store to a single Vaultwarden
 	// organization by UUID. Mutually exclusive with OrganizationName.
+	// This is the recommended way to select an organization in production.
 	// When both OrganizationID and OrganizationName are empty, the store
 	// operates on the user's personal vault only.
 	// +optional
@@ -38,7 +40,12 @@ type VaultwardenProvider struct {
 	// UUID from the authenticated user's profile when it authenticates.
 	// Mutually exclusive with OrganizationID. Resolution fails if zero or
 	// more than one of the user's organizations match the name.
+	//
+	// Prefer OrganizationID for production stores: a display name can be
+	// renamed or duplicated by an organization admin, which silently changes
+	// or breaks the store's scope. The webhook warns when this field is used.
 	// +optional
+	// +kubebuilder:validation:MinLength:=1
 	OrganizationName string `json:"organizationName,omitempty"`
 	// OrganizationKeyFingerprint pins the organization's symmetric key: the
 	// lowercase or uppercase hex SHA-256 of the 64-byte unwrapped organization

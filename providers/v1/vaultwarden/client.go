@@ -230,13 +230,17 @@ type pushSecretMetadata struct {
 	MergePolicy pushMergePolicy `json:"mergePolicy,omitempty"`
 }
 
-// Close zeroes the cached key material. The client re-authenticates if it is used again.
+// Close zeroes the cached key material and releases idle connections. The
+// client re-authenticates if it is used again.
 func (c *Client) Close(_ context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.cache != nil {
 		c.cache.invalidate()
 		c.cache = nil
+	}
+	if c.httpClient != nil {
+		c.httpClient.CloseIdleConnections()
 	}
 	return nil
 }

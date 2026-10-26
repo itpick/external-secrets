@@ -9372,6 +9372,7 @@ spec:
                           description: |-
                             OrganizationID, if set, scopes this store to a single Vaultwarden
                             organization by UUID. Mutually exclusive with OrganizationName.
+                            This is the recommended way to select an organization in production.
                             When both OrganizationID and OrganizationName are empty, the store
                             operates on the user's personal vault only.
                           format: uuid
@@ -9387,9 +9388,16 @@ spec:
                             UUID from the authenticated user's profile when it authenticates.
                             Mutually exclusive with OrganizationID. Resolution fails if zero or
                             more than one of the user's organizations match the name.
+
+                            Prefer OrganizationID for production stores: a display name can be
+                            renamed or duplicated by an organization admin, which silently changes
+                            or breaks the store's scope. The webhook warns when this field is used.
+                          minLength: 1
                           type: string
                         url:
-                          description: URL is the base URL of the Vaultwarden instance, e.g. https://vault.example.com
+                          description: |-
+                            URL is the base URL of the Vaultwarden instance, e.g. https://vault.example.com.
+                            Only https:// URLs are accepted (enforced by the webhook and the provider).
                           type: string
                       required:
                         - auth
@@ -23212,6 +23220,7 @@ spec:
                           description: |-
                             OrganizationID, if set, scopes this store to a single Vaultwarden
                             organization by UUID. Mutually exclusive with OrganizationName.
+                            This is the recommended way to select an organization in production.
                             When both OrganizationID and OrganizationName are empty, the store
                             operates on the user's personal vault only.
                           format: uuid
@@ -23227,9 +23236,16 @@ spec:
                             UUID from the authenticated user's profile when it authenticates.
                             Mutually exclusive with OrganizationID. Resolution fails if zero or
                             more than one of the user's organizations match the name.
+
+                            Prefer OrganizationID for production stores: a display name can be
+                            renamed or duplicated by an organization admin, which silently changes
+                            or breaks the store's scope. The webhook warns when this field is used.
+                          minLength: 1
                           type: string
                         url:
-                          description: URL is the base URL of the Vaultwarden instance, e.g. https://vault.example.com
+                          description: |-
+                            URL is the base URL of the Vaultwarden instance, e.g. https://vault.example.com.
+                            Only https:// URLs are accepted (enforced by the webhook and the provider).
                           type: string
                       required:
                         - auth
