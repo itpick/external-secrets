@@ -291,3 +291,60 @@ func TestOrganizationKeyFingerprintHelper(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, fingerprintOf(k.orgKey), got)
 }
+
+// L1: a GetSecretMap parse failure must not echo plaintext bytes from the
+// notes (encoding/json syntax errors quote the offending character).
+func TestGetSecretMapErrorDoesNotLeakPlaintext(t *testing.T) {
+	k := newHostileKeys(t)
+	fv := &hostileServer{
+		profile: k.personalProfile(),
+		ciphers: []map[string]any{
+			{"id": "p", "type": 2, "organizationId": nil, "deletedDate": nil,
+				"name": encS(t, "api-token", k.userEnc, k.userMac), "notes": encS(t, "hunter2", k.userEnc, k.userMac)},
+			{"id": "q", "type": 2, "organizationId": nil, "deletedDate": nil,
+				"name": encS(t, "half-json", k.userEnc, k.userMac), "notes": encS(t, `{"user":"admin"} Zecret`, k.userEnc, k.userMac)},
+		},
+	}
+	srv := httptest.NewTLSServer(fv)
+	defer srv.Close()
+	c := newHostileClient(t, srv, esv1.VaultwardenProvider{})
+
+	for key, leak := range map[string]string{"api-token": "'h'", "half-json": "'Z'"} {
+		_, err := c.GetSecretMap(context.Background(), esv1.ExternalSecretDataRemoteRef{Key: key})
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), leak)
+		assert.Contains(t, err.Error(), key)
+	}
+}
+
+// L2: the property-not-found error names the requested key, not the
+// cipher's EncString.
+func TestPropertyNotFoundErrorUsesKey(t *testing.T) {
+	k := newHostileKeys(t)
+	encName := encS(t, "svc", k.userEnc, k.userMac)
+	fv := &hostileServer{
+		profile: k.personalProfile(),
+		ciphers: []map[string]any{{"id": "p", "type": 2, "organizationId": nil, "deletedDate": nil, "name": encName, "notes": ""}},
+	}
+	srv := httptest.NewTLSServer(fv)
+	defer srv.Close()
+	c := newHostileClient(t, srv, esv1.VaultwardenProvider{})
+	_, err := c.GetSecret(context.Background(), esv1.ExternalSecretDataRemoteRef{Key: "svc", Property: "nope"})
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), encName)
+	assert.Contains(t, err.Error(), `"svc"`)
+}
+
+// L3: a differently-cased organizationId is canonicalised to the server's
+// spelling before it is sent on writes.
+func TestOrganizationIDCanonicalised(t *testing.T) {
+	k := newHostileKeys(t)
+	fv := &hostileServer{profile: k.orgProfile(t, k.orgKey)}
+	srv := httptest.NewTLSServer(fv)
+	defer srv.Close()
+	c := newHostileClient(t, srv, esv1.VaultwardenProvider{OrganizationID: strings.ToUpper(testOrgID)})
+	secret := &corev1.Secret{Data: map[string][]byte{"k": []byte("v")}}
+	require.NoError(t, c.PushSecret(context.Background(), secret, testPushData{secretKey: "k", remoteKey: "x"}))
+	require.Len(t, fv.posted, 1)
+	assert.Equal(t, testOrgID, fv.posted[0]["organizationId"])
+}

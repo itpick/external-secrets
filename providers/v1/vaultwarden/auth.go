@@ -43,7 +43,7 @@ import (
 // vaultwardenTokenResponse is the JSON response from /identity/connect/token.
 type vaultwardenTokenResponse struct {
 	AccessToken    string `json:"access_token"`
-	Key            string `json:"Key"`   // encrypted symmetric key
+	Key            string `json:"Key"` // encrypted symmetric key
 	Kdf            int    `json:"Kdf"`
 	KdfIterations  int    `json:"KdfIterations"`
 	KdfMemory      *int   `json:"KdfMemory"`
@@ -52,8 +52,8 @@ type vaultwardenTokenResponse struct {
 
 // vaultwardenProfile is the JSON response from /api/accounts/profile.
 type vaultwardenProfile struct {
-	Email          string `json:"email"`          // lowercase in profile response
-	Key            string `json:"key"`            // lowercase
+	Email          string `json:"email"` // lowercase in profile response
+	Key            string `json:"key"`   // lowercase
 	Kdf            int    `json:"kdf"`
 	KdfIterations  int    `json:"kdfIterations"`
 	KdfMemory      *int   `json:"kdfMemory"`
@@ -95,14 +95,16 @@ func resolveOrgByName(profile *vaultwardenProfile, name string) (orgID, encKey s
 	}
 }
 
-// resolveOrgByID returns the wrapped key of the organization with the given UUID.
-func resolveOrgByID(profile *vaultwardenProfile, id string) (string, error) {
+// resolveOrgByID returns the canonical UUID (as the server spells it) and the
+// wrapped key of the organization with the given UUID, matched case-insensitively.
+// Writes must use the canonical spelling: Vaultwarden compares org IDs as strings.
+func resolveOrgByID(profile *vaultwardenProfile, id string) (orgID, encKey string, err error) {
 	for _, o := range profile.Organizations {
 		if strings.EqualFold(o.ID, id) {
-			return o.Key, nil
+			return o.ID, o.Key, nil
 		}
 	}
-	return "", fmt.Errorf("vaultwarden: organizationId %q not found among the user's organizations", id)
+	return "", "", fmt.Errorf("vaultwarden: organizationId %q not found among the user's organizations", id)
 }
 
 func (c *Client) resolveSecretKeyRef(ctx context.Context, sel esmeta.SecretKeySelector) (string, error) {
@@ -291,8 +293,7 @@ func (c *Client) unlockOrgScope(profile *vaultwardenProfile, t *cachedToken) err
 	var err error
 	switch {
 	case c.provider.OrganizationID != "":
-		orgID = c.provider.OrganizationID
-		wrappedKey, err = resolveOrgByID(profile, orgID)
+		orgID, wrappedKey, err = resolveOrgByID(profile, c.provider.OrganizationID)
 	case c.provider.OrganizationName != "":
 		orgID, wrappedKey, err = resolveOrgByName(profile, c.provider.OrganizationName)
 	default:
@@ -388,4 +389,3 @@ func getProvider(store esv1.GenericStore) (*esv1.VaultwardenProvider, error) {
 	}
 	return spc.Provider.Vaultwarden, nil
 }
-

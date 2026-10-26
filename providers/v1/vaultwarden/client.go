@@ -39,9 +39,9 @@ import (
 // vaultwardenCipher represents a vault item returned from /api/sync.
 type vaultwardenCipher struct {
 	ID          string        `json:"id"`
-	Type        int           `json:"type"`        // 1=Login, 2=SecureNote
-	Name        string        `json:"name"`        // EncString
-	Notes       string        `json:"notes"`       // EncString (may be empty)
+	Type        int           `json:"type"`  // 1=Login, 2=SecureNote
+	Name        string        `json:"name"`  // EncString
+	Notes       string        `json:"notes"` // EncString (may be empty)
 	Login       *cipherLogin  `json:"login"`
 	Fields      []cipherField `json:"fields"`
 	DeletedDate any           `json:"deletedDate"`
@@ -237,14 +237,14 @@ func (c *Client) GetSecret(ctx context.Context, ref esv1.ExternalSecretDataRemot
 		return nil, err
 	}
 	if ref.Property != "" {
-		return getCipherProperty(cipher, ref.Property, tok)
+		return getCipherProperty(cipher, ref.Key, ref.Property, tok)
 	}
 	return getCipherValue(cipher, ref.Key, tok)
 }
 
 // getCipherProperty looks up a named property from a cipher's custom fields,
 // falling back to the cipher's Notes JSON for secrets written by this provider.
-func getCipherProperty(cipher *vaultwardenCipher, property string, tok *cachedToken) ([]byte, error) {
+func getCipherProperty(cipher *vaultwardenCipher, key, property string, tok *cachedToken) ([]byte, error) {
 	symEncKey, symMacKey := tok.keysFor(cipher)
 	for _, f := range cipher.Fields {
 		name, err := crypto.DecryptString(f.Name, symEncKey, symMacKey)
@@ -264,7 +264,7 @@ func getCipherProperty(cipher *vaultwardenCipher, property string, tok *cachedTo
 	} else if v != nil {
 		return v, nil
 	}
-	return nil, fmt.Errorf("vaultwarden: field %q not found in secret %q", property, cipher.Name)
+	return nil, fmt.Errorf("vaultwarden: field %q not found in secret %q", property, key)
 }
 
 // getCipherPropertyFromNotes attempts to extract a property from the Notes JSON.
@@ -337,7 +337,9 @@ func (c *Client) GetSecretMap(ctx context.Context, ref esv1.ExternalSecretDataRe
 
 	raw := make(map[string]json.RawMessage)
 	if err := json.Unmarshal([]byte(notes), &raw); err != nil {
-		return nil, fmt.Errorf("vaultwarden: notes for %q are not a JSON object: %w", ref.Key, err)
+		// The json error is deliberately not wrapped: syntax errors quote
+		// bytes of the (decrypted) notes.
+		return nil, fmt.Errorf("vaultwarden: notes for %q are not a JSON object", ref.Key)
 	}
 
 	out := make(map[string][]byte, len(raw))
