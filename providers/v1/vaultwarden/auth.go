@@ -20,7 +20,9 @@ package vaultwarden
 
 import (
 	"context"
+	"crypto/rsa"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -53,6 +55,51 @@ type vaultwardenProfile struct {
 	KdfIterations  int    `json:"kdfIterations"`
 	KdfMemory      *int   `json:"kdfMemory"`
 	KdfParallelism *int   `json:"kdfParallelism"`
+
+	// Organizations the user belongs to, each with its member-wrapped org key.
+	Organizations []orgEntry `json:"organizations"`
+	// PrivateKey is the user's RSA private key (PKCS#8 DER), encrypted with the
+	// user's symmetric key (EncString type 2). Only needed for org-scoped stores.
+	PrivateKey string `json:"privateKey"`
+}
+
+// orgEntry is one organization membership from /api/accounts/profile.
+type orgEntry struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	// Key is the 64-byte org symmetric key wrapped with the user's RSA public
+	// key (EncString type 4, RSA-OAEP-SHA1).
+	Key string `json:"key"`
+}
+
+// resolveOrgByName returns the UUID and wrapped key of the single organization
+// whose name exactly matches name. It errors if zero or more than one match.
+func resolveOrgByName(profile *vaultwardenProfile, name string) (orgID, encKey string, err error) {
+	matches := 0
+	for _, o := range profile.Organizations {
+		if o.Name == name {
+			orgID, encKey = o.ID, o.Key
+			matches++
+		}
+	}
+	switch matches {
+	case 0:
+		return "", "", fmt.Errorf("vaultwarden: no organization named %q", name)
+	case 1:
+		return orgID, encKey, nil
+	default:
+		return "", "", fmt.Errorf("vaultwarden: %d organizations are named %q; use organizationId instead", matches, name)
+	}
+}
+
+// resolveOrgByID returns the wrapped key of the organization with the given UUID.
+func resolveOrgByID(profile *vaultwardenProfile, id string) (string, error) {
+	for _, o := range profile.Organizations {
+		if strings.EqualFold(o.ID, id) {
+			return o.Key, nil
+		}
+	}
+	return "", fmt.Errorf("vaultwarden: organizationId %q not found among the user's organizations", id)
 }
 
 func (c *Client) resolveSecretKeyRef(ctx context.Context, sel esmeta.SecretKeySelector) (string, error) {
@@ -137,29 +184,30 @@ func (c *Client) fetchProfile(ctx context.Context, accessToken string) (*vaultwa
 	return &profile, nil
 }
 
-// getSymKey returns a cached or freshly derived access token and symmetric key material.
+// getToken returns a cached or freshly derived access token and key material.
 // Expensive HTTP calls and key derivation happen outside the mutex lock.
-func (c *Client) getSymKey(ctx context.Context) (accessToken string, symEncKey, symMacKey []byte, err error) {
+// The returned *cachedToken must be treated as read-only.
+func (c *Client) getToken(ctx context.Context) (*cachedToken, error) {
 	c.mu.Lock()
 	if c.cache != nil && time.Now().Before(c.cache.expiresAt) {
-		tok, enc, mac := c.cache.accessToken, c.cache.symEncKey, c.cache.symMacKey
+		t := c.cache
 		c.mu.Unlock()
-		return tok, enc, mac, nil
+		return t, nil
 	}
 	c.mu.Unlock()
 
 	tokenResp, err := c.fetchToken(ctx)
 	if err != nil {
-		return "", nil, nil, err
+		return nil, err
 	}
 	profile, err := c.fetchProfile(ctx, tokenResp.AccessToken)
 	if err != nil {
-		return "", nil, nil, err
+		return nil, err
 	}
 
 	masterPassword, err := c.resolveSecretKeyRef(ctx, c.provider.Auth.SecretRef.MasterPassword)
 	if err != nil {
-		return "", nil, nil, fmt.Errorf("vaultwarden: reading masterPassword: %w", err)
+		return nil, fmt.Errorf("vaultwarden: reading masterPassword: %w", err)
 	}
 
 	memVal, parVal := 0, 0
@@ -172,37 +220,119 @@ func (c *Client) getSymKey(ctx context.Context) (accessToken string, symEncKey, 
 
 	masterKey, err := crypto.DeriveKey(masterPassword, profile.Email, profile.Kdf, profile.KdfIterations, memVal, parVal)
 	if err != nil {
-		return "", nil, nil, fmt.Errorf("vaultwarden: deriving master key: %w", err)
+		return nil, fmt.Errorf("vaultwarden: deriving master key: %w", err)
 	}
 
 	stretchedEnc, stretchedMac, err := crypto.StretchKey(masterKey)
 	if err != nil {
-		return "", nil, nil, fmt.Errorf("vaultwarden: stretching master key: %w", err)
+		return nil, fmt.Errorf("vaultwarden: stretching master key: %w", err)
 	}
 
 	profileKeyES, err := crypto.ParseEncString(profile.Key)
 	if err != nil {
-		return "", nil, nil, fmt.Errorf("vaultwarden: parsing profile key: %w", err)
+		return nil, fmt.Errorf("vaultwarden: parsing profile key: %w", err)
 	}
 	symKeyBytes, err := crypto.Decrypt(profileKeyES, stretchedEnc, stretchedMac)
 	if err != nil {
-		return "", nil, nil, fmt.Errorf("vaultwarden: decrypting symmetric key: %w", err)
+		return nil, fmt.Errorf("vaultwarden: decrypting symmetric key: %w", err)
 	}
 	if len(symKeyBytes) < 64 {
-		return "", nil, nil, fmt.Errorf("vaultwarden: symmetric key too short (%d bytes)", len(symKeyBytes))
+		return nil, fmt.Errorf("vaultwarden: symmetric key too short (%d bytes)", len(symKeyBytes))
 	}
 
-	c.mu.Lock()
-	c.cache = &cachedToken{
+	t := &cachedToken{
 		accessToken: tokenResp.AccessToken,
 		symEncKey:   symKeyBytes[0:32],
 		symMacKey:   symKeyBytes[32:64],
 		expiresAt:   time.Now().Add(5 * time.Minute),
 	}
-	tok, enc, mac := c.cache.accessToken, c.cache.symEncKey, c.cache.symMacKey
-	c.mu.Unlock()
+	if err := c.unlockOrgScope(profile, t); err != nil {
+		return nil, err
+	}
 
-	return tok, enc, mac, nil
+	c.mu.Lock()
+	c.cache = t
+	c.mu.Unlock()
+	return t, nil
+}
+
+// getSymKey is a convenience wrapper around getToken returning the personal keys.
+func (c *Client) getSymKey(ctx context.Context) (accessToken string, symEncKey, symMacKey []byte, err error) {
+	t, err := c.getToken(ctx)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	return t.accessToken, t.symEncKey, t.symMacKey, nil
+}
+
+// unlockOrgScope populates t's org fields when the store is scoped to an
+// organization (organizationId or organizationName). For personal scope it is
+// a no-op. The org key is unwrapped with the user's RSA private key, which is
+// itself encrypted with the user symmetric key (not the stretched master key).
+func (c *Client) unlockOrgScope(profile *vaultwardenProfile, t *cachedToken) error {
+	var orgID, wrappedKey string
+	var err error
+	switch {
+	case c.provider.OrganizationID != "":
+		orgID = c.provider.OrganizationID
+		wrappedKey, err = resolveOrgByID(profile, orgID)
+	case c.provider.OrganizationName != "":
+		orgID, wrappedKey, err = resolveOrgByName(profile, c.provider.OrganizationName)
+	default:
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if wrappedKey == "" {
+		return fmt.Errorf("vaultwarden: organization %q has no key for this user", orgID)
+	}
+	if profile.PrivateKey == "" {
+		return errors.New("vaultwarden: user profile has no private key; cannot unlock organization key")
+	}
+
+	privDER, err := crypto.DecryptStringBytes(profile.PrivateKey, t.symEncKey, t.symMacKey)
+	if err != nil {
+		return fmt.Errorf("vaultwarden: decrypting user private key: %w", err)
+	}
+	rsaPriv, err := crypto.RSAPrivateKeyFromPKCS8DER(privDER)
+	zeroBytes(privDER)
+	if err != nil {
+		return fmt.Errorf("vaultwarden: %w", err)
+	}
+	orgEnc, orgMac, err := unlockOrgKey(wrappedKey, rsaPriv)
+	if err != nil {
+		return err
+	}
+	t.orgID = orgID
+	t.orgEncKey = orgEnc
+	t.orgMacKey = orgMac
+	return nil
+}
+
+// unlockOrgKey unwraps a type-4 org key with the user's RSA private key and
+// splits the 64-byte plaintext into enc and mac keys. The intermediate
+// plaintext is zeroed before returning.
+func unlockOrgKey(wrappedKey string, priv *rsa.PrivateKey) (orgEnc, orgMac []byte, err error) {
+	plain, err := crypto.DecryptRSAOAEP(wrappedKey, priv)
+	if err != nil {
+		return nil, nil, fmt.Errorf("vaultwarden: unwrapping organization key: %w", err)
+	}
+	defer zeroBytes(plain)
+	if len(plain) != 64 {
+		return nil, nil, fmt.Errorf("vaultwarden: organization key has unexpected length %d", len(plain))
+	}
+	orgEnc = make([]byte, 32)
+	orgMac = make([]byte, 32)
+	copy(orgEnc, plain[:32])
+	copy(orgMac, plain[32:])
+	return orgEnc, orgMac, nil
+}
+
+func zeroBytes(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
 }
 
 // getProvider extracts the VaultwardenProvider config from a generic store.

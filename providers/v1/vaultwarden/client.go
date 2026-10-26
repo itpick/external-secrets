@@ -85,6 +85,12 @@ type cachedToken struct {
 	symEncKey   []byte
 	symMacKey   []byte
 	expiresAt   time.Time
+
+	// Org scope, populated only when the store sets organizationId or
+	// organizationName. orgID is the resolved organization UUID.
+	orgID     string
+	orgEncKey []byte
+	orgMacKey []byte
 }
 
 // Client implements esv1.SecretsClient for Vaultwarden.

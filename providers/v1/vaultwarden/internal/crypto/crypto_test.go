@@ -17,6 +17,11 @@ limitations under the License.
 package crypto
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha1"
+	"crypto/x509"
+	"encoding/base64"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -79,4 +84,49 @@ func TestStretchKey(t *testing.T) {
 	assert.Len(t, encKey, 32)
 	assert.Len(t, macKey, 32)
 	assert.NotEqual(t, encKey, macKey)
+}
+
+func TestRSAOAEPRoundTrip(t *testing.T) {
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	plaintext := make([]byte, 64)
+	_, err = rand.Read(plaintext)
+	require.NoError(t, err)
+
+	ct, err := rsa.EncryptOAEP(sha1.New(), rand.Reader, &priv.PublicKey, plaintext, nil)
+	require.NoError(t, err)
+
+	got, err := DecryptRSAOAEP("4."+base64.StdEncoding.EncodeToString(ct), priv)
+	require.NoError(t, err)
+	assert.Equal(t, plaintext, got)
+
+	_, err = DecryptRSAOAEP("2."+base64.StdEncoding.EncodeToString(ct), priv)
+	assert.Error(t, err)
+}
+
+func TestRSAPrivateKeyFromPKCS8DER(t *testing.T) {
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	der, err := x509.MarshalPKCS8PrivateKey(priv)
+	require.NoError(t, err)
+
+	parsed, err := RSAPrivateKeyFromPKCS8DER(der)
+	require.NoError(t, err)
+	assert.Zero(t, parsed.N.Cmp(priv.N))
+
+	_, err = RSAPrivateKeyFromPKCS8DER([]byte("not a key"))
+	assert.Error(t, err)
+}
+
+func TestDecryptStringBytes(t *testing.T) {
+	encKey, macKey := deterministicTestKeys()
+	enc, err := Encrypt([]byte{0, 1, 2, 0xff}, encKey, macKey)
+	require.NoError(t, err)
+	got, err := DecryptStringBytes(enc, encKey, macKey)
+	require.NoError(t, err)
+	assert.Equal(t, []byte{0, 1, 2, 0xff}, got)
+
+	got, err = DecryptStringBytes("", encKey, macKey)
+	require.NoError(t, err)
+	assert.Nil(t, got)
 }

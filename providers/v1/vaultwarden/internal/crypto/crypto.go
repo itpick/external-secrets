@@ -23,7 +23,10 @@ import (
 	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha1" //nolint:gosec // OAEP key-wrap with SHA-1 matches the Bitwarden wire format; not used for signatures
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -147,19 +150,27 @@ func Decrypt(es EncString, encKey, macKey []byte) ([]byte, error) {
 }
 
 // DecryptString parses and decrypts a Bitwarden EncString value, returning the plaintext string.
+// Use DecryptStringBytes for binary payloads (e.g. a PKCS#8 DER key) so the plaintext
+// never lives in an immutable string and can be zeroed by the caller.
 func DecryptString(s string, encKey, macKey []byte) (string, error) {
-	if s == "" {
-		return "", nil
-	}
-	es, err := ParseEncString(s)
-	if err != nil {
-		return "", err
-	}
-	b, err := Decrypt(es, encKey, macKey)
+	b, err := DecryptStringBytes(s, encKey, macKey)
 	if err != nil {
 		return "", err
 	}
 	return string(b), nil
+}
+
+// DecryptStringBytes is the []byte-returning variant of DecryptString.
+// An empty input yields (nil, nil).
+func DecryptStringBytes(s string, encKey, macKey []byte) ([]byte, error) {
+	if s == "" {
+		return nil, nil
+	}
+	es, err := ParseEncString(s)
+	if err != nil {
+		return nil, err
+	}
+	return Decrypt(es, encKey, macKey)
 }
 
 // Encrypt encrypts plaintext using AES-256-CBC + HMAC-SHA256 and returns a Bitwarden EncString.
@@ -223,4 +234,37 @@ func pkcs7Unpad(data []byte) ([]byte, error) {
 		}
 	}
 	return data[:len(data)-padding], nil
+}
+
+// RSAPrivateKeyFromPKCS8DER parses a PKCS#8 DER-encoded private key (the decrypted
+// payload of a Bitwarden profile's privateKey) into an *rsa.PrivateKey.
+func RSAPrivateKeyFromPKCS8DER(der []byte) (*rsa.PrivateKey, error) {
+	key, err := x509.ParsePKCS8PrivateKey(der)
+	if err != nil {
+		return nil, fmt.Errorf("parse PKCS#8 private key: %w", err)
+	}
+	rsaKey, ok := key.(*rsa.PrivateKey)
+	if !ok {
+		return nil, errors.New("PKCS#8 private key is not RSA")
+	}
+	return rsaKey, nil
+}
+
+// DecryptRSAOAEP decrypts a Bitwarden EncString of type 4 ("4.<base64 RSA ciphertext>"),
+// i.e. RSA-2048-OAEP with SHA-1, which is how organization keys are wrapped for each
+// member. Returns the plaintext (a 64-byte org key: 32-byte enc key || 32-byte mac key).
+func DecryptRSAOAEP(encString string, priv *rsa.PrivateKey) ([]byte, error) {
+	const prefix = "4."
+	if !strings.HasPrefix(encString, prefix) {
+		return nil, errors.New("unsupported EncString type for RSA decryption (only type 4 supported)")
+	}
+	ct, err := base64.StdEncoding.DecodeString(encString[len(prefix):])
+	if err != nil {
+		return nil, fmt.Errorf("invalid RSA EncString: %w", err)
+	}
+	pt, err := rsa.DecryptOAEP(sha1.New(), nil, priv, ct, nil) //nolint:gosec // OAEP-SHA1 matches the Bitwarden wire format
+	if err != nil {
+		return nil, fmt.Errorf("RSA-OAEP decrypt: %w", err)
+	}
+	return pt, nil
 }
