@@ -53,6 +53,13 @@ const (
 	// certificate, needed when testing against a Vaultwarden instance that uses
 	// a self-signed certificate.
 	envVaultwardenCABundle = "VAULTWARDEN_CA_BUNDLE_FILE"
+
+	// Org-scope tests expect a fixture cipher named orgFixtureName to exist both
+	// in the user's personal vault (notes "personal-value") and in the
+	// organization (notes "org-value"), and are skipped unless one of these is set.
+	envVaultwardenOrgID   = "VAULTWARDEN_ORG_ID"
+	envVaultwardenOrgName = "VAULTWARDEN_ORG_NAME"
+	orgFixtureName        = "eso-int-test"
 )
 
 // buildTLSConfig builds a TLS config for integration tests.
@@ -218,7 +225,10 @@ func TestMain(m *testing.M) {
 			},
 		}
 		scheme := runtime.NewScheme()
-		_ = corev1.AddToScheme(scheme)
+		if err := corev1.AddToScheme(scheme); err != nil {
+			fmt.Fprintf(os.Stderr, "vaultwarden integration: corev1.AddToScheme: %v\n", err)
+			os.Exit(1)
+		}
 		kubeClient := clientfake.NewClientBuilder().WithScheme(scheme).WithObjects(k8sSecret).Build()
 		store := &esv1.SecretStore{
 			ObjectMeta: metav1.ObjectMeta{Name: "vaultwarden-test-store", Namespace: integrationNamespace},
@@ -371,4 +381,47 @@ func TestIntegration_Validate(t *testing.T) {
 	result, err := c.Validate()
 	require.NoError(t, err)
 	assert.Equal(t, esv1.ValidationResultReady, result)
+}
+
+// TestIntegration_OrgByID scopes the store to an organization UUID and checks
+// that GetSecret returns the org cipher, not the personal one with the same name.
+func TestIntegration_OrgByID(t *testing.T) {
+	orgID := os.Getenv(envVaultwardenOrgID)
+	if orgID == "" {
+		t.Skipf("%s not set", envVaultwardenOrgID)
+	}
+	c := buildIntegrationClient(t)
+	c.provider.OrganizationID = orgID
+
+	val, err := c.GetSecret(context.Background(), esv1.ExternalSecretDataRemoteRef{Key: orgFixtureName})
+	require.NoError(t, err)
+	assert.Equal(t, "org-value", string(val))
+}
+
+// TestIntegration_OrgByName scopes the store by organization name, which the
+// provider resolves to a UUID from the user's profile.
+func TestIntegration_OrgByName(t *testing.T) {
+	orgName := os.Getenv(envVaultwardenOrgName)
+	if orgName == "" {
+		t.Skipf("%s not set", envVaultwardenOrgName)
+	}
+	c := buildIntegrationClient(t)
+	c.provider.OrganizationName = orgName
+
+	val, err := c.GetSecret(context.Background(), esv1.ExternalSecretDataRemoteRef{Key: orgFixtureName})
+	require.NoError(t, err)
+	assert.Equal(t, "org-value", string(val))
+}
+
+// TestIntegration_PersonalScopeIgnoresOrg checks that a store with no org
+// configured returns the personal fixture and never the org one.
+func TestIntegration_PersonalScopeIgnoresOrg(t *testing.T) {
+	if os.Getenv(envVaultwardenOrgID) == "" && os.Getenv(envVaultwardenOrgName) == "" {
+		t.Skipf("neither %s nor %s set; org fixtures not provisioned", envVaultwardenOrgID, envVaultwardenOrgName)
+	}
+	c := buildIntegrationClient(t)
+
+	val, err := c.GetSecret(context.Background(), esv1.ExternalSecretDataRemoteRef{Key: orgFixtureName})
+	require.NoError(t, err)
+	assert.Equal(t, "personal-value", string(val))
 }
