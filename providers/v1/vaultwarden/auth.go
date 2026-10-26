@@ -249,7 +249,7 @@ func (c *Client) authenticate(ctx context.Context, creds *credentials) (*cachedT
 		parVal = *profile.KdfParallelism
 	}
 
-	masterKey, err := crypto.DeriveKey(creds.masterPassword, profile.Email, profile.Kdf, profile.KdfIterations, memVal, parVal)
+	masterKey, err := crypto.DeriveKey(ctx, creds.masterPassword, profile.Email, profile.Kdf, profile.KdfIterations, memVal, parVal)
 	if err != nil {
 		return nil, fmt.Errorf("vaultwarden: deriving master key: %w", err)
 	}

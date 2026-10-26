@@ -17,6 +17,7 @@ limitations under the License.
 package crypto
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
@@ -28,6 +29,7 @@ import (
 	"encoding/base64"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -74,7 +76,7 @@ func TestMACValidation(t *testing.T) {
 }
 
 func TestDeriveKeyPBKDF2(t *testing.T) {
-	key, err := DeriveKey("parolaribame4", "test@vaultwarden.local", KdfTypePBKDF2, 600000, 0, 0)
+	key, err := DeriveKey(context.Background(), "parolaribame4", "test@vaultwarden.local", KdfTypePBKDF2, 600000, 0, 0)
 	require.NoError(t, err)
 	assert.Len(t, key, 32)
 }
@@ -182,4 +184,20 @@ func TestDecryptErrorsAreIndistinguishable(t *testing.T) {
 	require.NoError(t, err)
 	_, err = DecryptRSAOAEP("4."+base64.StdEncoding.EncodeToString(make([]byte, 256)), priv)
 	assert.ErrorIs(t, err, errInvalidCiphertext)
+}
+
+func TestDeriveKeyPBKDF2IterationBounds(t *testing.T) {
+	for _, iters := range []int{0, 1, MinPBKDF2Iterations - 1, MaxPBKDF2Iterations + 1} {
+		_, err := DeriveKey(context.Background(), "pw", "a@b.c", KdfTypePBKDF2, iters, 0, 0)
+		require.Error(t, err, "iterations=%d", iters)
+	}
+}
+
+func TestDeriveKeyCancelled(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := DeriveKey(ctx, "pw", "a@b.c", KdfTypePBKDF2, MaxPBKDF2Iterations, 0, 0)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, time.Since(start), 200*time.Millisecond)
 }

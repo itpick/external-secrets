@@ -126,7 +126,7 @@ func newFakeVaultwarden(t *testing.T, scope esv1.VaultwardenProvider) (*fakeVaul
 	userEnc, userMac := make32(1), make32(33)
 	orgKey := append(make32(65), make32(97)...)
 
-	masterKey, err := crypto.DeriveKey(testPassword, testEmail, crypto.KdfTypePBKDF2, 1, 0, 0)
+	masterKey, err := crypto.DeriveKey(context.Background(), testPassword, testEmail, crypto.KdfTypePBKDF2, testKdfIterations, 0, 0)
 	require.NoError(t, err)
 	stretchedEnc, stretchedMac, err := crypto.StretchKey(masterKey)
 	require.NoError(t, err)
@@ -135,7 +135,7 @@ func newFakeVaultwarden(t *testing.T, scope esv1.VaultwardenProvider) (*fakeVaul
 
 	p := fakeOrgProfile(t, userEnc, userMac, orgKey, "Example")
 	profile := map[string]any{
-		"email": testEmail, "key": protectedUserKey, "kdf": 0, "kdfIterations": 1,
+		"email": testEmail, "key": protectedUserKey, "kdf": 0, "kdfIterations": testKdfIterations,
 		"privateKey": p.PrivateKey, "organizations": p.Organizations,
 	}
 

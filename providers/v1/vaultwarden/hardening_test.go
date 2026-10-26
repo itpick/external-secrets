@@ -34,6 +34,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -129,7 +130,7 @@ type hostileKeys struct {
 func newHostileKeys(t *testing.T) hostileKeys {
 	t.Helper()
 	k := hostileKeys{userEnc: make32(1), userMac: make32(33), orgKey: append(make32(65), make32(97)...)}
-	masterKey, err := crypto.DeriveKey(testPassword, testEmail, crypto.KdfTypePBKDF2, testKdfIterations, 0, 0)
+	masterKey, err := crypto.DeriveKey(context.Background(), testPassword, testEmail, crypto.KdfTypePBKDF2, testKdfIterations, 0, 0)
 	require.NoError(t, err)
 	se, sm, err := crypto.StretchKey(masterKey)
 	require.NoError(t, err)
@@ -347,4 +348,46 @@ func TestOrganizationIDCanonicalised(t *testing.T) {
 	require.NoError(t, c.PushSecret(context.Background(), secret, testPushData{secretKey: "k", remoteKey: "x"}))
 	require.Len(t, fv.posted, 1)
 	assert.Equal(t, testOrgID, fv.posted[0]["organizationId"])
+}
+
+// M3: server-supplied PBKDF2 iteration counts outside the accepted range are
+// rejected instead of burning unbounded controller CPU.
+func TestKDFIterationsBounded(t *testing.T) {
+	k := newHostileKeys(t)
+	for _, iters := range []int{1, 99999, 2000001, 5000000} {
+		profile := k.personalProfile()
+		profile["kdfIterations"] = iters
+		srv := httptest.NewTLSServer(&hostileServer{profile: profile})
+		c := newHostileClient(t, srv, esv1.VaultwardenProvider{})
+		start := time.Now()
+		_, err := c.getToken(context.Background())
+		el := time.Since(start)
+		srv.Close()
+		require.Error(t, err, "kdfIterations=%d", iters)
+		assert.Contains(t, err.Error(), "kdfIterations")
+		assert.Less(t, el, time.Second, "kdfIterations=%d", iters)
+	}
+}
+
+// M3: key derivation is abandoned when the context is cancelled.
+func TestKDFHonoursContextCancellation(t *testing.T) {
+	k := newHostileKeys(t)
+	profile := k.personalProfile()
+	profile["kdfIterations"] = 2000000
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fv := &hostileServer{profile: profile}
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fv.ServeHTTP(w, r)
+		if r.URL.Path == "/api/accounts/profile" {
+			// Cancel once the client has the profile and is deriving the key.
+			time.AfterFunc(20*time.Millisecond, cancel)
+		}
+	}))
+	defer srv.Close()
+	c := newHostileClient(t, srv, esv1.VaultwardenProvider{})
+	_, err := c.getToken(ctx)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.Canceled)
 }

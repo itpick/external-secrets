@@ -19,6 +19,7 @@ limitations under the License.
 package crypto
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
@@ -87,22 +88,54 @@ func ParseEncString(s string) (EncString, error) {
 	return EncString{Type: 2, IV: iv, CT: ct, MAC: mac}, nil
 }
 
+// Accepted PBKDF2 iteration counts. The count comes from the server, so it is
+// bounded: too low makes the master key cheap to brute-force from a captured
+// protected key, too high lets a hostile server pin controller CPU.
+const (
+	MinPBKDF2Iterations = 100000
+	MaxPBKDF2Iterations = 2000000
+)
+
 // DeriveKey derives the 256-bit master key from masterPassword and email using PBKDF2 or Argon2id.
-// The email is used as the salt (lowercased and trimmed).
-func DeriveKey(masterPassword, email string, kdfType, iterations, _ /* memory */, _ /* parallelism */ int) ([]byte, error) {
+// The email is used as the salt (lowercased and trimmed). The derivation runs
+// in a goroutine so that DeriveKey returns ctx.Err() as soon as ctx is done;
+// the abandoned goroutine finishes its bounded work and zeroes its result.
+func DeriveKey(ctx context.Context, masterPassword, email string, kdfType, iterations, _ /* memory */, _ /* parallelism */ int) ([]byte, error) {
 	salt := []byte(strings.ToLower(strings.TrimSpace(email)))
 	switch kdfType {
 	case KdfTypePBKDF2:
-		if iterations <= 0 {
-			iterations = 600000
+		if iterations < MinPBKDF2Iterations || iterations > MaxPBKDF2Iterations {
+			return nil, fmt.Errorf("server-supplied kdfIterations %d outside accepted range [%d, %d]",
+				iterations, MinPBKDF2Iterations, MaxPBKDF2Iterations)
 		}
-		return pbkdf2.Key([]byte(masterPassword), salt, iterations, 32, sha256.New), nil
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		pw := []byte(masterPassword)
+		done := make(chan []byte, 1)
+		go func() {
+			defer zero(pw)
+			done <- pbkdf2.Key(pw, salt, iterations, 32, sha256.New)
+		}()
+		select {
+		case key := <-done:
+			return key, nil
+		case <-ctx.Done():
+			go func() { zero(<-done) }()
+			return nil, ctx.Err()
+		}
 	case KdfTypeArgon2id:
 		// Argon2id support requires the golang.org/x/crypto/argon2 import and
 		// would use: argon2.IDKey([]byte(masterPassword), salt, uint32(iterations), uint32(memory), uint8(parallelism), 32).
 		return nil, errors.New("argon2id not yet implemented")
 	default:
 		return nil, fmt.Errorf("unknown KDF type %d", kdfType)
+	}
+}
+
+func zero(b []byte) {
+	for i := range b {
+		b[i] = 0
 	}
 }
 
