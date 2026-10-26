@@ -419,15 +419,20 @@ func TestKDFHonoursContextCancellation(t *testing.T) {
 }
 
 // M2: an oversized /api/sync body is rejected rather than decoded into
-// unbounded controller memory.
+// unbounded controller memory. Not parallel: it lowers the package limit
+// (decoding 64 MiB under -race takes minutes); the test streams ~4 MiB more
+// than the limit.
 func TestSyncBodySizeLimited(t *testing.T) {
-	t.Parallel()
+	orig := maxSyncBodyBytes
+	maxSyncBodyBytes = 4 << 20
+	t.Cleanup(func() { maxSyncBodyBytes = orig })
 	k := newHostileKeys(t)
 	filler := strings.Repeat("A", 16*1024)
 	fv := &hostileServer{profile: k.personalProfile()}
+	n := int(maxSyncBodyBytes/int64(len(filler))) + 256
 	fv.syncHook = func(w http.ResponseWriter, _ *http.Request) bool {
 		_, _ = w.Write([]byte(`{"ciphers":[`))
-		for i := 0; i < 4200; i++ { // ~68 MiB
+		for i := range n {
 			if i > 0 {
 				_, _ = w.Write([]byte(","))
 			}

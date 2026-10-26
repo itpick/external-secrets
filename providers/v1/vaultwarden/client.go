@@ -745,10 +745,10 @@ func (c *Client) forgetCiphers() {
 
 // Response size limits. Bodies are decoded as a stream, never buffered whole,
 // and a body that exceeds its limit is an error rather than being truncated.
-const (
-	maxAuthBodyBytes = 1 << 20  // token and profile responses
-	maxSyncBodyBytes = 64 << 20 // GET /api/sync
-)
+const maxAuthBodyBytes = 1 << 20 // token and profile responses
+
+// maxSyncBodyBytes limits GET /api/sync. A variable only so tests can lower it.
+var maxSyncBodyBytes int64 = 64 << 20
 
 var errBodyTooLarge = errors.New("vaultwarden: response body exceeds size limit")
 
