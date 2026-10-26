@@ -9368,6 +9368,22 @@ spec:
                             - name
                             - type
                           type: object
+                        organizationId:
+                          description: |-
+                            OrganizationID, if set, scopes this store to a single Vaultwarden
+                            organization by UUID. Mutually exclusive with OrganizationName.
+                            When both OrganizationID and OrganizationName are empty, the store
+                            operates on the user's personal vault only.
+                          format: uuid
+                          type: string
+                        organizationName:
+                          description: |-
+                            OrganizationName, if set, scopes this store to a single Vaultwarden
+                            organization by its display name. The provider resolves the name to a
+                            UUID from the authenticated user's profile when it authenticates.
+                            Mutually exclusive with OrganizationID. Resolution fails if zero or
+                            more than one of the user's organizations match the name.
+                          type: string
                         url:
                           description: URL is the base URL of the Vaultwarden instance, e.g. https://vault.example.com
                           type: string
@@ -23188,6 +23204,22 @@ spec:
                             - name
                             - type
                           type: object
+                        organizationId:
+                          description: |-
+                            OrganizationID, if set, scopes this store to a single Vaultwarden
+                            organization by UUID. Mutually exclusive with OrganizationName.
+                            When both OrganizationID and OrganizationName are empty, the store
+                            operates on the user's personal vault only.
+                          format: uuid
+                          type: string
+                        organizationName:
+                          description: |-
+                            OrganizationName, if set, scopes this store to a single Vaultwarden
+                            organization by its display name. The provider resolves the name to a
+                            UUID from the authenticated user's profile when it authenticates.
+                            Mutually exclusive with OrganizationID. Resolution fails if zero or
+                            more than one of the user's organizations match the name.
+                          type: string
                         url:
                           description: URL is the base URL of the Vaultwarden instance, e.g. https://vault.example.com
                           type: string
