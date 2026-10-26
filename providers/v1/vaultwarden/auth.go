@@ -256,15 +256,6 @@ func (c *Client) getToken(ctx context.Context) (*cachedToken, error) {
 	return t, nil
 }
 
-// getSymKey is a convenience wrapper around getToken returning the personal keys.
-func (c *Client) getSymKey(ctx context.Context) (accessToken string, symEncKey, symMacKey []byte, err error) {
-	t, err := c.getToken(ctx)
-	if err != nil {
-		return "", nil, nil, err
-	}
-	return t.accessToken, t.symEncKey, t.symMacKey, nil
-}
-
 // unlockOrgScope populates t's org fields when the store is scoped to an
 // organization (organizationId or organizationName). For personal scope it is
 // a no-op. The org key is unwrapped with the user's RSA private key, which is
