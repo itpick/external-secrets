@@ -17,11 +17,16 @@ limitations under the License.
 package crypto
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha1"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -65,7 +70,7 @@ func TestMACValidation(t *testing.T) {
 	es, err := ParseEncString(enc)
 	require.NoError(t, err)
 	_, err = Decrypt(es, encKey, wrongMacKey)
-	assert.ErrorContains(t, err, "MAC validation failed")
+	assert.ErrorIs(t, err, errInvalidCiphertext)
 }
 
 func TestDeriveKeyPBKDF2(t *testing.T) {
@@ -129,4 +134,52 @@ func TestDecryptStringBytes(t *testing.T) {
 	got, err = DecryptStringBytes("", encKey, macKey)
 	require.NoError(t, err)
 	assert.Nil(t, got)
+}
+
+// Every decrypt-side failure must surface the same error so the API cannot be
+// used as a padding/format oracle.
+func TestDecryptErrorsAreIndistinguishable(t *testing.T) {
+	encKey, macKey := deterministicTestKeys()
+
+	valid, err := EncryptString("hello-from-vault", encKey, macKey)
+	require.NoError(t, err)
+	parts := strings.Split(strings.TrimPrefix(valid, "2."), "|")
+	macBytes, err := base64.StdEncoding.DecodeString(parts[2])
+	require.NoError(t, err)
+	macBytes[len(macBytes)-1] ^= 0x01
+	tamperedMAC := "2." + parts[0] + "|" + parts[1] + "|" + base64.StdEncoding.EncodeToString(macBytes)
+
+	// Valid MAC over a ciphertext whose plaintext has invalid PKCS#7 padding.
+	iv := make([]byte, aes.BlockSize)
+	plaintext := make([]byte, 32)
+	plaintext[31] = 0xFF
+	block, err := aes.NewCipher(encKey)
+	require.NoError(t, err)
+	ct := make([]byte, len(plaintext))
+	cipher.NewCBCEncrypter(block, iv).CryptBlocks(ct, plaintext)
+	h := hmac.New(sha256.New, macKey)
+	h.Write(iv)
+	h.Write(ct)
+	badPadding := "2." + base64.StdEncoding.EncodeToString(iv) + "|" +
+		base64.StdEncoding.EncodeToString(ct) + "|" + base64.StdEncoding.EncodeToString(h.Sum(nil))
+
+	for name, in := range map[string]string{
+		"tampered mac":   tamperedMAC,
+		"bad padding":    badPadding,
+		"no type prefix": "garbage",
+		"wrong type":     "0." + parts[0] + "|" + parts[1] + "|" + parts[2],
+		"missing parts":  "2." + parts[0],
+		"bad base64":     "2.!!|!!|!!",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := DecryptString(in, encKey, macKey)
+			assert.ErrorIs(t, err, errInvalidCiphertext)
+			assert.Equal(t, errInvalidCiphertext.Error(), err.Error())
+		})
+	}
+
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	_, err = DecryptRSAOAEP("4."+base64.StdEncoding.EncodeToString(make([]byte, 256)), priv)
+	assert.ErrorIs(t, err, errInvalidCiphertext)
 }

@@ -23,7 +23,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"regexp"
 	"strings"
@@ -138,6 +137,20 @@ func (t *cachedToken) keysFor(c *vaultwardenCipher) (enc, mac []byte) {
 	return t.symEncKey, t.symMacKey
 }
 
+// invalidate zeroes all key material in place and clears the token so the
+// secrets do not linger in memory once the client is done with them.
+func (t *cachedToken) invalidate() {
+	zeroBytes(t.symEncKey)
+	zeroBytes(t.symMacKey)
+	zeroBytes(t.orgEncKey)
+	zeroBytes(t.orgMacKey)
+	t.accessToken = ""
+	t.symEncKey, t.symMacKey = nil, nil
+	t.orgEncKey, t.orgMacKey = nil, nil
+	t.orgID = ""
+	t.expiresAt = time.Time{}
+}
+
 // writeKeys returns the key pair used to encrypt new ciphers in the store's scope.
 func (t *cachedToken) writeKeys() (enc, mac []byte) {
 	if t.orgID != "" {
@@ -177,8 +190,14 @@ type pushSecretMetadata struct {
 	MergePolicy pushMergePolicy `json:"mergePolicy,omitempty"`
 }
 
-// Close is a no-op.
+// Close zeroes the cached key material. The client re-authenticates if it is used again.
 func (c *Client) Close(_ context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cache != nil {
+		c.cache.invalidate()
+		c.cache = nil
+	}
 	return nil
 }
 
@@ -500,9 +519,9 @@ func (c *Client) upsertCipher(ctx context.Context, accessToken string, existing 
 		return fmt.Errorf("vaultwarden: cipher request failed: %w", err)
 	}
 	defer resp.Body.Close()
+	// The response body is deliberately not included: it may echo request content.
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("vaultwarden: cipher request returned HTTP %d: %s", resp.StatusCode, body)
+		return fmt.Errorf("vaultwarden: cipher request returned HTTP %d", resp.StatusCode)
 	}
 	return nil
 }
@@ -538,8 +557,7 @@ func (c *Client) DeleteSecret(ctx context.Context, remoteRef esv1.PushSecretRemo
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("vaultwarden: delete cipher returned HTTP %d: %s", resp.StatusCode, body)
+		return fmt.Errorf("vaultwarden: delete cipher returned HTTP %d", resp.StatusCode)
 	}
 	return nil
 }
