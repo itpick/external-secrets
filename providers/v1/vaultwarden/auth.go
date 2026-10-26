@@ -24,7 +24,6 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -161,14 +160,14 @@ func (c *Client) fetchToken(ctx context.Context, creds *credentials) (*vaultward
 	if err != nil {
 		return nil, fmt.Errorf("vaultwarden: token request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("vaultwarden: token endpoint returned HTTP %d", resp.StatusCode)
 	}
 
 	var tokenResp vaultwardenTokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+	if err := decodeJSONLimited(resp.Body, maxAuthBodyBytes, &tokenResp); err != nil {
 		return nil, fmt.Errorf("vaultwarden: decoding token response: %w", err)
 	}
 	return &tokenResp, nil
@@ -179,7 +178,7 @@ func (c *Client) fetchToken(ctx context.Context, creds *credentials) (*vaultward
 // https://bitwarden.com/help/public-api/
 func (c *Client) fetchProfile(ctx context.Context, accessToken string) (*vaultwardenProfile, error) {
 	profileURL := strings.TrimRight(c.provider.URL, "/") + "/api/accounts/profile"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, profileURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, profileURL, http.NoBody)
 	if err != nil {
 		return nil, fmt.Errorf("vaultwarden: building profile request: %w", err)
 	}
@@ -189,14 +188,14 @@ func (c *Client) fetchProfile(ctx context.Context, accessToken string) (*vaultwa
 	if err != nil {
 		return nil, fmt.Errorf("vaultwarden: profile request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("vaultwarden: profile endpoint returned HTTP %d", resp.StatusCode)
 	}
 
 	var profile vaultwardenProfile
-	if err := json.NewDecoder(resp.Body).Decode(&profile); err != nil {
+	if err := decodeJSONLimited(resp.Body, maxAuthBodyBytes, &profile); err != nil {
 		return nil, fmt.Errorf("vaultwarden: decoding profile response: %w", err)
 	}
 	return &profile, nil

@@ -29,6 +29,7 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -390,4 +391,59 @@ func TestKDFHonoursContextCancellation(t *testing.T) {
 	_, err := c.getToken(ctx)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, context.Canceled)
+}
+
+// M2: an oversized /api/sync body is rejected rather than decoded into
+// unbounded controller memory.
+func TestSyncBodySizeLimited(t *testing.T) {
+	k := newHostileKeys(t)
+	filler := strings.Repeat("A", 16*1024)
+	fv := &hostileServer{profile: k.personalProfile()}
+	fv.syncHook = func(w http.ResponseWriter, _ *http.Request) bool {
+		_, _ = w.Write([]byte(`{"ciphers":[`))
+		for i := 0; i < 4200; i++ { // ~68 MiB
+			if i > 0 {
+				_, _ = w.Write([]byte(","))
+			}
+			_, _ = fmt.Fprintf(w, `{"id":"%d","type":2,"organizationId":null,"deletedDate":null,"name":"2.x|y|z","notes":"%s"}`, i, filler)
+		}
+		_, _ = w.Write([]byte(`]}`))
+		return true
+	}
+	srv := httptest.NewTLSServer(fv)
+	defer srv.Close()
+	c := newHostileClient(t, srv, esv1.VaultwardenProvider{})
+	_, err := c.GetAllSecrets(context.Background(), esv1.ExternalSecretFind{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "size limit")
+}
+
+// M2: oversized token and profile bodies are rejected.
+func TestAuthBodySizeLimited(t *testing.T) {
+	k := newHostileKeys(t)
+	pad := strings.Repeat("A", 2<<20)
+	for _, path := range []string{"/identity/connect/token", "/api/accounts/profile"} {
+		t.Run(path, func(t *testing.T) {
+			profile := k.personalProfile()
+			fv := &hostileServer{profile: profile}
+			srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == path {
+					w.Header().Set("Content-Type", "application/json")
+					if path == "/api/accounts/profile" {
+						profile["padding"] = pad
+						_ = json.NewEncoder(w).Encode(profile)
+					} else {
+						_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "tok", "padding": pad})
+					}
+					return
+				}
+				fv.ServeHTTP(w, r)
+			}))
+			defer srv.Close()
+			c := newHostileClient(t, srv, esv1.VaultwardenProvider{})
+			_, err := c.getToken(context.Background())
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "size limit")
+		})
+	}
 }

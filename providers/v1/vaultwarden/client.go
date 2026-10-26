@@ -22,7 +22,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
 	"strings"
@@ -522,7 +524,7 @@ func (c *Client) upsertCipher(ctx context.Context, accessToken string, existing 
 	if err != nil {
 		return fmt.Errorf("vaultwarden: cipher request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	// The response body is deliberately not included: it may echo request content.
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("vaultwarden: cipher request returned HTTP %d", resp.StatusCode)
@@ -549,7 +551,7 @@ func (c *Client) DeleteSecret(ctx context.Context, remoteRef esv1.PushSecretRemo
 
 	base := strings.TrimRight(c.provider.URL, "/")
 	deleteURL := fmt.Sprintf("%s/api/ciphers/%s", base, cipher.ID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, deleteURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, deleteURL, http.NoBody)
 	if err != nil {
 		return fmt.Errorf("vaultwarden: building delete request: %w", err)
 	}
@@ -559,7 +561,7 @@ func (c *Client) DeleteSecret(ctx context.Context, remoteRef esv1.PushSecretRemo
 	if err != nil {
 		return fmt.Errorf("vaultwarden: deleting cipher: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
 		return fmt.Errorf("vaultwarden: delete cipher returned HTTP %d", resp.StatusCode)
 	}
@@ -587,7 +589,7 @@ func (c *Client) SecretExists(ctx context.Context, remoteRef esv1.PushSecretRemo
 // only the ciphers in the store's scope.
 func (c *Client) listCiphers(ctx context.Context, tok *cachedToken) ([]vaultwardenCipher, error) {
 	syncURL := strings.TrimRight(c.provider.URL, "/") + "/api/sync?excludeDomains=true"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, syncURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, syncURL, http.NoBody)
 	if err != nil {
 		return nil, fmt.Errorf("vaultwarden: building sync request: %w", err)
 	}
@@ -597,17 +599,37 @@ func (c *Client) listCiphers(ctx context.Context, tok *cachedToken) ([]vaultward
 	if err != nil {
 		return nil, fmt.Errorf("vaultwarden: sync request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("vaultwarden: sync endpoint returned HTTP %d", resp.StatusCode)
 	}
 
 	var sync syncResponse
-	if err := json.NewDecoder(resp.Body).Decode(&sync); err != nil {
+	if err := decodeJSONLimited(resp.Body, maxSyncBodyBytes, &sync); err != nil {
 		return nil, fmt.Errorf("vaultwarden: decoding sync response: %w", err)
 	}
 	return filterCiphersByScope(sync.Ciphers, tok.orgID), nil
+}
+
+// Response size limits. Bodies are decoded as a stream, never buffered whole,
+// and a body that exceeds its limit is an error rather than being truncated.
+const (
+	maxAuthBodyBytes = 1 << 20  // token and profile responses
+	maxSyncBodyBytes = 64 << 20 // GET /api/sync
+)
+
+var errBodyTooLarge = errors.New("vaultwarden: response body exceeds size limit")
+
+// decodeJSONLimited decodes one JSON value from r into v, failing with
+// errBodyTooLarge if that requires reading more than limit bytes.
+func decodeJSONLimited(r io.Reader, limit int64, v any) error {
+	lr := &io.LimitedReader{R: r, N: limit + 1}
+	err := json.NewDecoder(lr).Decode(v)
+	if lr.N <= 0 {
+		return errBodyTooLarge
+	}
+	return err
 }
 
 // findCipherByName returns the matching cipher or esv1.NoSecretError.
