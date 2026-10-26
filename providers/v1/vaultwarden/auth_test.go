@@ -84,7 +84,7 @@ func TestUnlockOrgKey(t *testing.T) {
 	assert.Equal(t, orgKey[32:], mac)
 	assert.Equal(t, sha256.Sum256(orgKey), fp)
 
-	_, _, _, err = unlockOrgKey(wrapOrgKey(t, &priv.PublicKey, make([]byte, 32)), priv)
+	_, _, _, err = unlockOrgKey(wrapOrgKey(t, &priv.PublicKey, make([]byte, 32)), priv) //nolint:dogsled // only the error matters
 	assert.ErrorContains(t, err, "unexpected length")
 }
 

@@ -544,7 +544,7 @@ func (c *Client) PushSecret(ctx context.Context, secret *corev1.Secret, data esv
 
 // buildPushValue extracts the value to push from the Kubernetes secret.
 // If a specific key is requested, that key's raw bytes are returned.
-// Otherwise all data keys are JSON-marshalled as a string map.
+// Otherwise all data keys are JSON-marshaled as a string map.
 func buildPushValue(secret *corev1.Secret, data esv1.PushSecretData) ([]byte, error) {
 	if key := data.GetSecretKey(); key != "" {
 		val, ok := secret.Data[key]
@@ -561,7 +561,7 @@ func buildPushValue(secret *corev1.Secret, data esv1.PushSecretData) ([]byte, er
 	}
 	b, err := json.Marshal(strData)
 	if err != nil {
-		return nil, fmt.Errorf("vaultwarden: marshalling secret data: %w", err)
+		return nil, fmt.Errorf("vaultwarden: marshaling secret data: %w", err)
 	}
 	return b, nil
 }
@@ -598,7 +598,7 @@ func buildCipherBody(name, notes string, tok *cachedToken) ([]byte, error) {
 	}
 	b, err := json.Marshal(body)
 	if err != nil {
-		return nil, fmt.Errorf("vaultwarden: marshalling cipher body: %w", err)
+		return nil, fmt.Errorf("vaultwarden: marshaling cipher body: %w", err)
 	}
 	return b, nil
 }

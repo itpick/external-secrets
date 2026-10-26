@@ -394,7 +394,7 @@ func TestKDFIterationsBounded(t *testing.T) {
 	}
 }
 
-// M3: key derivation is abandoned when the context is cancelled.
+// M3: key derivation is abandoned when the context is canceled.
 func TestKDFHonoursContextCancellation(t *testing.T) {
 	t.Parallel()
 	k := newHostileKeys(t)
@@ -669,7 +669,7 @@ type idleSpyTransport struct {
 
 func (s *idleSpyTransport) CloseIdleConnections() { s.closed = true }
 
-// Info: the transport honours proxy settings and Close releases idle connections.
+// Info: the transport honors proxy settings and Close releases idle connections.
 func TestHTTPClientHygiene(t *testing.T) {
 	t.Parallel()
 	store := newStore(&esv1.VaultwardenProvider{URL: "https://vw.example.com"})

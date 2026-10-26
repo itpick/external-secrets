@@ -125,7 +125,7 @@ const pbkdf2CtxCheckInterval = 4096
 
 // pbkdf2SHA256 is PBKDF2-HMAC-SHA256 (RFC 8018) for a single 32-byte output
 // block, which is all Bitwarden needs, checking ctx every
-// pbkdf2CtxCheckInterval iterations so a cancelled derivation stops working.
+// pbkdf2CtxCheckInterval iterations so a canceled derivation stops working.
 func pbkdf2SHA256(ctx context.Context, password, salt []byte, iterations int) ([]byte, error) {
 	prf := hmac.New(sha256.New, password)
 	prf.Write(salt)
