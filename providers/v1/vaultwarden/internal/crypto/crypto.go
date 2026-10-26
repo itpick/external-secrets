@@ -19,6 +19,7 @@ limitations under the License.
 package crypto
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -27,6 +28,7 @@ import (
 	"crypto/rsa"
 	"crypto/sha1" //nolint:gosec // OAEP key-wrap with SHA-1 matches the Bitwarden wire format; not used for signatures
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/x509"
 	"encoding/base64"
 	"errors"
@@ -35,7 +37,6 @@ import (
 	"strings"
 
 	"golang.org/x/crypto/hkdf"
-	"golang.org/x/crypto/pbkdf2"
 )
 
 // KDF type constants matching Bitwarden/Vaultwarden API values.
@@ -97,9 +98,8 @@ const (
 )
 
 // DeriveKey derives the 256-bit master key from masterPassword and email using PBKDF2 or Argon2id.
-// The email is used as the salt (lowercased and trimmed). The derivation runs
-// in a goroutine so that DeriveKey returns ctx.Err() as soon as ctx is done;
-// the abandoned goroutine finishes its bounded work and zeroes its result.
+// The email is used as the salt (lowercased and trimmed). PBKDF2 checks ctx
+// periodically and stops with ctx.Err() soon after ctx is done.
 func DeriveKey(ctx context.Context, masterPassword, email string, kdfType, iterations, _ /* memory */, _ /* parallelism */ int) ([]byte, error) {
 	salt := []byte(strings.ToLower(strings.TrimSpace(email)))
 	switch kdfType {
@@ -108,22 +108,9 @@ func DeriveKey(ctx context.Context, masterPassword, email string, kdfType, itera
 			return nil, fmt.Errorf("server-supplied kdfIterations %d outside accepted range [%d, %d]",
 				iterations, MinPBKDF2Iterations, MaxPBKDF2Iterations)
 		}
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
 		pw := []byte(masterPassword)
-		done := make(chan []byte, 1)
-		go func() {
-			defer zero(pw)
-			done <- pbkdf2.Key(pw, salt, iterations, 32, sha256.New)
-		}()
-		select {
-		case key := <-done:
-			return key, nil
-		case <-ctx.Done():
-			go func() { zero(<-done) }()
-			return nil, ctx.Err()
-		}
+		defer zero(pw)
+		return pbkdf2SHA256(ctx, pw, salt, iterations)
 	case KdfTypeArgon2id:
 		// Argon2id support requires the golang.org/x/crypto/argon2 import and
 		// would use: argon2.IDKey([]byte(masterPassword), salt, uint32(iterations), uint32(memory), uint8(parallelism), 32).
@@ -131,6 +118,35 @@ func DeriveKey(ctx context.Context, masterPassword, email string, kdfType, itera
 	default:
 		return nil, fmt.Errorf("unknown KDF type %d", kdfType)
 	}
+}
+
+// pbkdf2CtxCheckInterval is how many PBKDF2 iterations run between ctx checks.
+const pbkdf2CtxCheckInterval = 4096
+
+// pbkdf2SHA256 is PBKDF2-HMAC-SHA256 (RFC 8018) for a single 32-byte output
+// block, which is all Bitwarden needs, checking ctx every
+// pbkdf2CtxCheckInterval iterations so a cancelled derivation stops working.
+func pbkdf2SHA256(ctx context.Context, password, salt []byte, iterations int) ([]byte, error) {
+	prf := hmac.New(sha256.New, password)
+	prf.Write(salt)
+	prf.Write([]byte{0, 0, 0, 1})
+	u := prf.Sum(nil)
+	t := bytes.Clone(u)
+	for i := 1; i < iterations; i++ {
+		if i%pbkdf2CtxCheckInterval == 0 {
+			if err := ctx.Err(); err != nil {
+				zero(u)
+				zero(t)
+				return nil, err
+			}
+		}
+		prf.Reset()
+		prf.Write(u)
+		u = prf.Sum(u[:0])
+		subtle.XORBytes(t, t, u)
+	}
+	zero(u)
+	return t, nil
 }
 
 func zero(b []byte) {

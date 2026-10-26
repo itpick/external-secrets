@@ -27,12 +27,14 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/crypto/pbkdf2"
 )
 
 // deterministicTestKeys returns fixed enc/mac keys for deterministic tests.
@@ -200,4 +202,17 @@ func TestDeriveKeyCancelled(t *testing.T) {
 	_, err := DeriveKey(ctx, "pw", "a@b.c", KdfTypePBKDF2, MaxPBKDF2Iterations, 0, 0)
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	assert.Less(t, time.Since(start), 200*time.Millisecond)
+}
+
+// pbkdf2SHA256 must match RFC 7914 section 11 (PBKDF2-HMAC-SHA256, first
+// 32 bytes) and the reference implementation.
+func TestPBKDF2SHA256KnownAnswers(t *testing.T) {
+	got, err := pbkdf2SHA256(context.Background(), []byte("passwd"), []byte("salt"), 1)
+	require.NoError(t, err)
+	want, _ := hex.DecodeString("55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc")
+	assert.Equal(t, want, got)
+
+	got, err = pbkdf2SHA256(context.Background(), []byte("Password"), []byte("NaCl"), 80000)
+	require.NoError(t, err)
+	assert.Equal(t, pbkdf2.Key([]byte("Password"), []byte("NaCl"), 80000, 32, sha256.New), got)
 }
