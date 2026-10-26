@@ -151,8 +151,9 @@ type secureNoteObj struct {
 	Type int `json:"type"` // 0
 }
 
-// cachedToken holds a short-lived access token and symmetric key material
-// so we don't re-authenticate on every API call within the same reconciliation.
+// cachedToken holds a short-lived access token and the unlocked key material.
+// Each Client and the package session cache own separate copies (see clone),
+// so zeroing one copy never affects another holder.
 type cachedToken struct {
 	accessToken string
 	symEncKey   []byte
@@ -168,6 +169,16 @@ type cachedToken struct {
 	orgKeyFingerprint [32]byte
 }
 
+// clone returns a copy of t with its own key buffers.
+func (t *cachedToken) clone() *cachedToken {
+	c := *t
+	c.symEncKey = bytes.Clone(t.symEncKey)
+	c.symMacKey = bytes.Clone(t.symMacKey)
+	c.orgEncKey = bytes.Clone(t.orgEncKey)
+	c.orgMacKey = bytes.Clone(t.orgMacKey)
+	return &c
+}
+
 // keysFor returns the key pair that decrypts c: the org keys for a cipher owned
 // by the scoped organization, the user's personal keys otherwise.
 func (t *cachedToken) keysFor(c *vaultwardenCipher) (enc, mac []byte) {
@@ -177,8 +188,8 @@ func (t *cachedToken) keysFor(c *vaultwardenCipher) (enc, mac []byte) {
 	return t.symEncKey, t.symMacKey
 }
 
-// invalidate zeroes all key material in place and clears the token so the
-// secrets do not linger in memory once the client is done with them.
+// invalidate zeroes this copy's key buffers in place and clears its fields.
+// The access token is a Go string and cannot be scrubbed, only dropped.
 func (t *cachedToken) invalidate() {
 	zeroBytes(t.symEncKey)
 	zeroBytes(t.symMacKey)
@@ -207,9 +218,25 @@ type Client struct {
 	namespace  string
 	store      esv1.GenericStore
 
-	mu    sync.Mutex
-	cache *cachedToken
+	// ops is held shared by every operation that uses key material and
+	// exclusively by Close, so Close never zeroes keys an operation is using.
+	ops sync.RWMutex
+
+	mu         sync.Mutex
+	cache      *cachedToken
+	retired    []*cachedToken // replaced tokens, zeroed on Close
+	session    sessionKey
+	hasSession bool
+
+	// Memoised scoped cipher list for cache, so one reconcile with N data[]
+	// entries costs one /api/sync. Cleared after every write.
+	ciphers   []vaultwardenCipher
+	ciphersOf *cachedToken
+	ciphersAt time.Time
 }
+
+// cipherListTTL bounds how long a memoised cipher list is reused by a Client.
+const cipherListTTL = 30 * time.Second
 
 var _ esv1.SecretsClient = &Client{}
 
@@ -230,15 +257,26 @@ type pushSecretMetadata struct {
 	MergePolicy pushMergePolicy `json:"mergePolicy,omitempty"`
 }
 
-// Close zeroes the cached key material and releases idle connections. The
-// client re-authenticates if it is used again.
+// Close zeroes this Client's copies of the user and organization keys, once
+// in-flight operations on it have finished, and releases idle connections.
+// The client re-authenticates if it is used again. Close does not scrub: the
+// access token and credentials (Go strings); the package session cache's own
+// copy, which is zeroed when it expires (at most sessionTTL later); or copies
+// the Go runtime may have made.
 func (c *Client) Close(_ context.Context) error {
+	c.ops.Lock()
+	defer c.ops.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.cache != nil {
 		c.cache.invalidate()
 		c.cache = nil
 	}
+	for _, t := range c.retired {
+		t.invalidate()
+	}
+	c.retired = nil
+	c.ciphers, c.ciphersOf = nil, nil
 	if c.httpClient != nil {
 		c.httpClient.CloseIdleConnections()
 	}
@@ -250,6 +288,8 @@ func (c *Client) Validate() (esv1.ValidationResult, error) {
 	if c.store.GetObjectKind().GroupVersionKind().Kind == esv1.ClusterSecretStoreKind {
 		return esv1.ValidationResultUnknown, nil
 	}
+	c.ops.RLock()
+	defer c.ops.RUnlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	tok, err := c.getToken(ctx)
@@ -266,6 +306,8 @@ func (c *Client) Validate() (esv1.ValidationResult, error) {
 // If ref.Property is set it looks up a named custom field; otherwise it returns
 // the decrypted notes (SecureNote) or password (Login).
 func (c *Client) GetSecret(ctx context.Context, ref esv1.ExternalSecretDataRemoteRef) ([]byte, error) {
+	c.ops.RLock()
+	defer c.ops.RUnlock()
 	tok, err := c.getToken(ctx)
 	if err != nil {
 		return nil, err
@@ -352,6 +394,8 @@ func getCipherValue(cipher *vaultwardenCipher, key string, tok *cachedToken) ([]
 
 // GetSecretMap returns a map of keys to values by parsing the cipher's decrypted notes as JSON.
 func (c *Client) GetSecretMap(ctx context.Context, ref esv1.ExternalSecretDataRemoteRef) (map[string][]byte, error) {
+	c.ops.RLock()
+	defer c.ops.RUnlock()
 	tok, err := c.getToken(ctx)
 	if err != nil {
 		return nil, err
@@ -393,6 +437,8 @@ func (c *Client) GetSecretMap(ctx context.Context, ref esv1.ExternalSecretDataRe
 
 // GetAllSecrets returns all ciphers (optionally filtered by name regexp) as a name→value map.
 func (c *Client) GetAllSecrets(ctx context.Context, ref esv1.ExternalSecretFind) (map[string][]byte, error) {
+	c.ops.RLock()
+	defer c.ops.RUnlock()
 	tok, err := c.getToken(ctx)
 	if err != nil {
 		return nil, err
@@ -456,6 +502,8 @@ func decryptCipherPrimaryValue(cipher *vaultwardenCipher, symEncKey, symMacKey [
 // PushSecret writes a secret value to Vaultwarden as a SecureNote cipher.
 // Accepts optional metadata: {"mergePolicy":"Replace"} (default) or {"mergePolicy":"Error"}.
 func (c *Client) PushSecret(ctx context.Context, secret *corev1.Secret, data esv1.PushSecretData) error {
+	c.ops.RLock()
+	defer c.ops.RUnlock()
 	var meta pushSecretMetadata
 	if m := data.GetMetadata(); m != nil {
 		if err := json.Unmarshal(m.Raw, &meta); err != nil {
@@ -490,6 +538,7 @@ func (c *Client) PushSecret(ctx context.Context, secret *corev1.Secret, data esv
 	if existing != nil && !isManaged(existing, tok) {
 		return errNotManaged("overwrite", cipherName)
 	}
+	defer c.forgetCiphers()
 	return c.upsertCipher(ctx, tok.accessToken, existing, bodyBytes)
 }
 
@@ -584,6 +633,8 @@ func (c *Client) upsertCipher(ctx context.Context, accessToken string, existing 
 // (soft delete, recoverable by a human). It refuses items the provider did not
 // create. Idempotent — returns nil if not found.
 func (c *Client) DeleteSecret(ctx context.Context, remoteRef esv1.PushSecretRemoteRef) error {
+	c.ops.RLock()
+	defer c.ops.RUnlock()
 	tok, err := c.getToken(ctx)
 	if err != nil {
 		return err
@@ -602,6 +653,7 @@ func (c *Client) DeleteSecret(ctx context.Context, remoteRef esv1.PushSecretRemo
 		return errNotManaged("delete", remoteRef.GetRemoteKey())
 	}
 
+	defer c.forgetCiphers()
 	base := strings.TrimRight(c.provider.URL, "/")
 	deleteURL := base + "/api/ciphers/" + url.PathEscape(cipher.ID) + "/delete"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, deleteURL, http.NoBody)
@@ -623,6 +675,8 @@ func (c *Client) DeleteSecret(ctx context.Context, remoteRef esv1.PushSecretRemo
 
 // SecretExists returns true if a cipher with the given remote key name exists in the vault.
 func (c *Client) SecretExists(ctx context.Context, remoteRef esv1.PushSecretRemoteRef) (bool, error) {
+	c.ops.RLock()
+	defer c.ops.RUnlock()
 	tok, err := c.getToken(ctx)
 	if err != nil {
 		return false, err
@@ -637,10 +691,19 @@ func (c *Client) SecretExists(ctx context.Context, remoteRef esv1.PushSecretRemo
 	return cipher != nil, nil
 }
 
-// listCiphers fetches the vault via /api/sync (which, unlike /api/ciphers, is
-// guaranteed to include organization items the user can access) and returns
-// only the ciphers in the store's scope.
+// listCiphers returns the ciphers in the store's scope, memoised per Client
+// and token for cipherListTTL. It fetches the vault via /api/sync (which,
+// unlike /api/ciphers, is guaranteed to include organization items the user
+// can access). The returned slice is shared and must not be modified.
 func (c *Client) listCiphers(ctx context.Context, tok *cachedToken) ([]vaultwardenCipher, error) {
+	c.mu.Lock()
+	if c.ciphersOf == tok && time.Since(c.ciphersAt) < cipherListTTL {
+		list := c.ciphers
+		c.mu.Unlock()
+		return list, nil
+	}
+	c.mu.Unlock()
+
 	syncURL := strings.TrimRight(c.provider.URL, "/") + "/api/sync?excludeDomains=true"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, syncURL, http.NoBody)
 	if err != nil {
@@ -654,6 +717,9 @@ func (c *Client) listCiphers(ctx context.Context, tok *cachedToken) ([]vaultward
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	if resp.StatusCode == http.StatusUnauthorized {
+		c.dropSession()
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("vaultwarden: sync endpoint returned HTTP %d", resp.StatusCode)
 	}
@@ -662,7 +728,19 @@ func (c *Client) listCiphers(ctx context.Context, tok *cachedToken) ([]vaultward
 	if err := decodeJSONLimited(resp.Body, maxSyncBodyBytes, &sync); err != nil {
 		return nil, fmt.Errorf("vaultwarden: decoding sync response: %w", err)
 	}
-	return filterCiphersByScope(sync.Ciphers, tok.orgID), nil
+	list := filterCiphersByScope(sync.Ciphers, tok.orgID)
+
+	c.mu.Lock()
+	c.ciphers, c.ciphersOf, c.ciphersAt = list, tok, time.Now()
+	c.mu.Unlock()
+	return list, nil
+}
+
+// forgetCiphers drops the memoised cipher list (after a write).
+func (c *Client) forgetCiphers() {
+	c.mu.Lock()
+	c.ciphers, c.ciphersOf = nil, nil
+	c.mu.Unlock()
 }
 
 // Response size limits. Bodies are decoded as a stream, never buffered whole,

@@ -19,6 +19,7 @@ limitations under the License.
 package vaultwarden
 
 import (
+	"bytes"
 	"context"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -42,7 +43,8 @@ import (
 // vaultwardenTokenResponse is the JSON response from /identity/connect/token.
 type vaultwardenTokenResponse struct {
 	AccessToken    string `json:"access_token"`
-	Key            string `json:"Key"` // encrypted symmetric key
+	ExpiresIn      int    `json:"expires_in"` // seconds
+	Key            string `json:"Key"`        // encrypted symmetric key
 	Kdf            int    `json:"Kdf"`
 	KdfIterations  int    `json:"KdfIterations"`
 	KdfMemory      *int   `json:"KdfMemory"`
@@ -145,7 +147,7 @@ func (c *Client) fetchToken(ctx context.Context, creds *credentials) (*vaultward
 	form.Set("client_id", creds.clientID)
 	form.Set("client_secret", creds.clientSecret)
 	form.Set("scope", "api")
-	form.Set("DeviceIdentifier", uuid.NewSHA1(uuid.NameSpaceURL, []byte(c.namespace+"/"+c.store.GetName())).String())
+	form.Set("DeviceIdentifier", c.deviceIdentifier())
 	form.Set("DeviceType", "21")
 	form.Set("DeviceName", "eso-provider")
 
@@ -201,9 +203,34 @@ func (c *Client) fetchProfile(ctx context.Context, accessToken string) (*vaultwa
 	return &profile, nil
 }
 
-// getToken returns a cached or freshly derived access token and key material.
-// Expensive HTTP calls and key derivation happen outside the mutex lock.
-// The returned *cachedToken must be treated as read-only.
+// deviceIdentifier is the stable device UUID the store logs in as. It depends
+// only on the store's identity: a SecretStore is "<namespace>/<name>" (as
+// before), a ClusterSecretStore is "ClusterSecretStore/<name>" whichever
+// namespace is using it (namespaces cannot contain upper case, so the two
+// forms never collide).
+func (c *Client) deviceIdentifier() string {
+	id := c.store.GetNamespace() + "/" + c.store.GetName()
+	if c.store.GetKind() == esv1.ClusterSecretStoreKind {
+		id = esv1.ClusterSecretStoreKind + "/" + c.store.GetName()
+	}
+	return uuid.NewSHA1(uuid.NameSpaceURL, []byte(id)).String()
+}
+
+// sessionKey identifies the login for this store and these credentials in
+// the package session cache.
+func (c *Client) sessionKey(creds *credentials) sessionKey {
+	return sessions.key("v1",
+		c.store.GetKind(), c.store.GetNamespace(), c.store.GetName(), string(c.store.GetUID()),
+		strings.TrimRight(c.provider.URL, "/"),
+		c.provider.OrganizationID, c.provider.OrganizationName, strings.ToLower(c.provider.OrganizationKeyFingerprint),
+		creds.clientID, creds.clientSecret, creds.masterPassword)
+}
+
+// getToken returns this Client's token and key material, reusing, in order,
+// the Client's own copy, a copy from the package session cache, or a fresh
+// login. Expensive HTTP calls and key derivation happen outside the mutex.
+// The returned *cachedToken must be treated as read-only; it stays valid
+// until Close, which waits for in-flight operations.
 func (c *Client) getToken(ctx context.Context) (*cachedToken, error) {
 	c.mu.Lock()
 	if c.cache != nil && time.Now().Before(c.cache.expiresAt) {
@@ -217,15 +244,38 @@ func (c *Client) getToken(ctx context.Context) (*cachedToken, error) {
 	if err != nil {
 		return nil, err
 	}
-	t, err := c.authenticate(ctx, creds)
-	if err != nil {
-		return nil, err
+	key := c.sessionKey(creds)
+	t := sessions.get(key, time.Now())
+	if t == nil {
+		if t, err = c.authenticate(ctx, creds); err != nil {
+			return nil, err
+		}
+		sessions.put(key, t, time.Now())
 	}
 
 	c.mu.Lock()
+	if c.cache != nil {
+		// An operation may still be using it; Close zeroes it.
+		c.retired = append(c.retired, c.cache)
+	}
 	c.cache = t
+	c.session, c.hasSession = key, true
 	c.mu.Unlock()
 	return t, nil
+}
+
+// dropSession forgets the current login, here and in the session cache, so
+// the next operation logs in again (used when the server rejects the token).
+func (c *Client) dropSession() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.hasSession {
+		sessions.drop(c.session)
+	}
+	if c.cache != nil {
+		c.retired = append(c.retired, c.cache)
+		c.cache = nil
+	}
 }
 
 // authenticate logs in with creds, unlocks the user key and, for org-scoped
@@ -252,35 +302,49 @@ func (c *Client) authenticate(ctx context.Context, creds *credentials) (*cachedT
 	if err != nil {
 		return nil, fmt.Errorf("vaultwarden: deriving master key: %w", err)
 	}
-
-	stretchedEnc, stretchedMac, err := crypto.StretchKey(masterKey)
+	symEnc, symMac, err := unlockUserKey(masterKey, profile.Key)
 	if err != nil {
-		return nil, fmt.Errorf("vaultwarden: stretching master key: %w", err)
-	}
-
-	profileKeyES, err := crypto.ParseEncString(profile.Key)
-	if err != nil {
-		return nil, fmt.Errorf("vaultwarden: parsing profile key: %w", err)
-	}
-	symKeyBytes, err := crypto.Decrypt(profileKeyES, stretchedEnc, stretchedMac)
-	if err != nil {
-		return nil, fmt.Errorf("vaultwarden: decrypting symmetric key: %w", err)
-	}
-	if len(symKeyBytes) < 64 {
-		return nil, fmt.Errorf("vaultwarden: symmetric key too short (%d bytes)", len(symKeyBytes))
+		return nil, err
 	}
 
 	t := &cachedToken{
 		accessToken: tokenResp.AccessToken,
-		symEncKey:   symKeyBytes[0:32],
-		symMacKey:   symKeyBytes[32:64],
-		expiresAt:   time.Now().Add(5 * time.Minute),
+		symEncKey:   symEnc,
+		symMacKey:   symMac,
+		expiresAt:   time.Now().Add(sessionLifetime(tokenResp.ExpiresIn)),
 	}
 	if err := c.unlockOrgScope(profile, t); err != nil {
 		t.invalidate()
 		return nil, err
 	}
 	return t, nil
+}
+
+// unlockUserKey decrypts the protected user key with the master key and
+// returns fresh copies of its enc and mac halves. masterKey, the stretched
+// keys and the decrypted buffer are zeroed before returning.
+func unlockUserKey(masterKey []byte, protectedKey string) (enc, mac []byte, err error) {
+	defer zeroBytes(masterKey)
+	stretchedEnc, stretchedMac, err := crypto.StretchKey(masterKey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("vaultwarden: stretching master key: %w", err)
+	}
+	defer zeroBytes(stretchedEnc)
+	defer zeroBytes(stretchedMac)
+
+	profileKeyES, err := crypto.ParseEncString(protectedKey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("vaultwarden: parsing profile key: %w", err)
+	}
+	symKeyBytes, err := crypto.Decrypt(profileKeyES, stretchedEnc, stretchedMac)
+	if err != nil {
+		return nil, nil, fmt.Errorf("vaultwarden: decrypting symmetric key: %w", err)
+	}
+	defer zeroBytes(symKeyBytes)
+	if len(symKeyBytes) < 64 {
+		return nil, nil, fmt.Errorf("vaultwarden: symmetric key too short (%d bytes)", len(symKeyBytes))
+	}
+	return bytes.Clone(symKeyBytes[0:32]), bytes.Clone(symKeyBytes[32:64]), nil
 }
 
 // unlockOrgScope populates t's org fields when the store is scoped to an

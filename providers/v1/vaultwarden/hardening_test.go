@@ -22,6 +22,7 @@ package vaultwarden
 // test drives the provider against a hostile or misbehaving fake server.
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -129,13 +130,27 @@ type hostileKeys struct {
 	encPriv          string
 }
 
+// testMasterKey derives the test account's master key once per test binary
+// (PBKDF2 at the minimum accepted iteration count is slow under -race).
+var testMasterKey = sync.OnceValues(func() ([]byte, error) {
+	return crypto.DeriveKey(context.Background(), testPassword, testEmail, crypto.KdfTypePBKDF2, testKdfIterations, 0, 0)
+})
+
+// testStretchedKeys returns the stretched enc/mac keys of the test account.
+func testStretchedKeys(t *testing.T) (enc, mac []byte) {
+	t.Helper()
+	masterKey, err := testMasterKey()
+	require.NoError(t, err)
+	enc, mac, err = crypto.StretchKey(masterKey)
+	require.NoError(t, err)
+	return enc, mac
+}
+
 func newHostileKeys(t *testing.T) hostileKeys {
 	t.Helper()
 	k := hostileKeys{userEnc: make32(1), userMac: make32(33), orgKey: append(make32(65), make32(97)...)}
-	masterKey, err := crypto.DeriveKey(context.Background(), testPassword, testEmail, crypto.KdfTypePBKDF2, testKdfIterations, 0, 0)
-	require.NoError(t, err)
-	se, sm, err := crypto.StretchKey(masterKey)
-	require.NoError(t, err)
+	se, sm := testStretchedKeys(t)
+	var err error
 	k.protectedUserKey, err = crypto.Encrypt(append(append([]byte{}, k.userEnc...), k.userMac...), se, sm)
 	require.NoError(t, err)
 	k.priv, err = rsa.GenerateKey(rand.Reader, 2048)
@@ -207,6 +222,7 @@ func newHostileClient(t *testing.T, srv *httptest.Server, scope esv1.Vaultwarden
 // knows must be rejected when the store pins the organization key fingerprint,
 // for reads and, crucially, before any PushSecret payload is encrypted.
 func TestOrgKeyFingerprintRejectsSubstitutedKey(t *testing.T) {
+	t.Parallel()
 	k := newHostileKeys(t)
 	attackerKey := make([]byte, 64)
 	_, _ = rand.Read(attackerKey)
@@ -238,6 +254,7 @@ func TestOrgKeyFingerprintRejectsSubstitutedKey(t *testing.T) {
 
 // H1: the matching fingerprint (either hex case) is accepted.
 func TestOrgKeyFingerprintAcceptsGenuineKey(t *testing.T) {
+	t.Parallel()
 	k := newHostileKeys(t)
 	fv := &hostileServer{
 		profile: k.orgProfile(t, k.orgKey),
@@ -260,6 +277,7 @@ func TestOrgKeyFingerprintAcceptsGenuineKey(t *testing.T) {
 // H1: an org-scoped store without a pinned fingerprint is admitted with a
 // warning; a malformed or orphaned fingerprint is rejected.
 func TestValidateStoreOrgKeyFingerprint(t *testing.T) {
+	t.Parallel()
 	const fp = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	p := &Provider{}
 	w, err := p.ValidateStore(newStore(&esv1.VaultwardenProvider{URL: "https://vw.example.com", OrganizationID: testOrgID}))
@@ -287,6 +305,7 @@ func containsSubstring(ss []string, sub string) bool {
 
 // H1: the operator helper reports the fingerprint of the genuine org key.
 func TestOrganizationKeyFingerprintHelper(t *testing.T) {
+	t.Parallel()
 	k := newHostileKeys(t)
 	srv := httptest.NewTLSServer(&hostileServer{profile: k.orgProfile(t, k.orgKey)})
 	defer srv.Close()
@@ -298,6 +317,7 @@ func TestOrganizationKeyFingerprintHelper(t *testing.T) {
 // L1: a GetSecretMap parse failure must not echo plaintext bytes from the
 // notes (encoding/json syntax errors quote the offending character).
 func TestGetSecretMapErrorDoesNotLeakPlaintext(t *testing.T) {
+	t.Parallel()
 	k := newHostileKeys(t)
 	fv := &hostileServer{
 		profile: k.personalProfile(),
@@ -323,6 +343,7 @@ func TestGetSecretMapErrorDoesNotLeakPlaintext(t *testing.T) {
 // L2: the property-not-found error names the requested key, not the
 // cipher's EncString.
 func TestPropertyNotFoundErrorUsesKey(t *testing.T) {
+	t.Parallel()
 	k := newHostileKeys(t)
 	encName := encS(t, "svc", k.userEnc, k.userMac)
 	fv := &hostileServer{
@@ -341,6 +362,7 @@ func TestPropertyNotFoundErrorUsesKey(t *testing.T) {
 // L3: a differently-cased organizationId is canonicalised to the server's
 // spelling before it is sent on writes.
 func TestOrganizationIDCanonicalised(t *testing.T) {
+	t.Parallel()
 	k := newHostileKeys(t)
 	fv := &hostileServer{profile: k.orgProfile(t, k.orgKey)}
 	srv := httptest.NewTLSServer(fv)
@@ -355,6 +377,7 @@ func TestOrganizationIDCanonicalised(t *testing.T) {
 // M3: server-supplied PBKDF2 iteration counts outside the accepted range are
 // rejected instead of burning unbounded controller CPU.
 func TestKDFIterationsBounded(t *testing.T) {
+	t.Parallel()
 	k := newHostileKeys(t)
 	for _, iters := range []int{1, 99999, 2000001, 5000000} {
 		profile := k.personalProfile()
@@ -373,6 +396,7 @@ func TestKDFIterationsBounded(t *testing.T) {
 
 // M3: key derivation is abandoned when the context is cancelled.
 func TestKDFHonoursContextCancellation(t *testing.T) {
+	t.Parallel()
 	k := newHostileKeys(t)
 	profile := k.personalProfile()
 	profile["kdfIterations"] = 2000000
@@ -397,6 +421,7 @@ func TestKDFHonoursContextCancellation(t *testing.T) {
 // M2: an oversized /api/sync body is rejected rather than decoded into
 // unbounded controller memory.
 func TestSyncBodySizeLimited(t *testing.T) {
+	t.Parallel()
 	k := newHostileKeys(t)
 	filler := strings.Repeat("A", 16*1024)
 	fv := &hostileServer{profile: k.personalProfile()}
@@ -421,6 +446,7 @@ func TestSyncBodySizeLimited(t *testing.T) {
 
 // M2: oversized token and profile bodies are rejected.
 func TestAuthBodySizeLimited(t *testing.T) {
+	t.Parallel()
 	k := newHostileKeys(t)
 	pad := strings.Repeat("A", 2<<20)
 	for _, path := range []string{"/identity/connect/token", "/api/accounts/profile"} {
@@ -475,6 +501,7 @@ func hasManagedMarker(t *testing.T, body map[string]any, e, m []byte) bool {
 // M1: PushSecret and DeleteSecret must not touch a same-named item that a
 // human created (a Login here), and must not hard-delete anything.
 func TestPushAndDeleteRefuseUnmanagedItems(t *testing.T) {
+	t.Parallel()
 	k := newHostileKeys(t)
 	humanLogin := map[string]any{"id": "human-login-1", "type": 1, "organizationId": nil, "deletedDate": nil,
 		"name":  encS(t, "prod-admin", k.userEnc, k.userMac),
@@ -505,6 +532,7 @@ func TestPushAndDeleteRefuseUnmanagedItems(t *testing.T) {
 // M1: items ESO creates carry the managed marker; ESO updates and soft-deletes
 // its own items, path-escaping the server-supplied ID.
 func TestPushAndDeleteManagedItems(t *testing.T) {
+	t.Parallel()
 	k := newHostileKeys(t)
 	const oddID = "a/../b?c"
 	fv := &hostileServer{profile: k.personalProfile(), ciphers: []map[string]any{managedNote(t, k, oddID, "app-db", "old")}}
@@ -538,6 +566,7 @@ func TestPushAndDeleteManagedItems(t *testing.T) {
 
 // M1: a missing secret is reported as esv1.NoSecretErr.
 func TestGetSecretNotFoundIsNoSecretErr(t *testing.T) {
+	t.Parallel()
 	k := newHostileKeys(t)
 	srv := httptest.NewTLSServer(&hostileServer{profile: k.personalProfile()})
 	defer srv.Close()
@@ -550,6 +579,7 @@ func TestGetSecretNotFoundIsNoSecretErr(t *testing.T) {
 
 // L6: only absolute https:// URLs are accepted.
 func TestValidateStoreRequiresHTTPS(t *testing.T) {
+	t.Parallel()
 	p := &Provider{}
 	for _, u := range []string{"", "http://vw.example.com", "vw.example.com", "ftp://vw.example.com", "https://", "https://user:pw@vw.example.com"} {
 		_, err := p.ValidateStore(newStore(&esv1.VaultwardenProvider{URL: u}))
@@ -562,6 +592,7 @@ func TestValidateStoreRequiresHTTPS(t *testing.T) {
 // L4/L6: organizationName must not be blank, and using it draws a warning
 // recommending organizationId.
 func TestValidateStoreOrganizationName(t *testing.T) {
+	t.Parallel()
 	p := &Provider{}
 	_, err := p.ValidateStore(newStore(&esv1.VaultwardenProvider{URL: "https://vw.example.com", OrganizationName: "   "}))
 	assert.Error(t, err)
@@ -576,6 +607,7 @@ func TestValidateStoreOrganizationName(t *testing.T) {
 // L6: the production HTTP client must not follow redirects: a 307 from the
 // token endpoint would re-send client_id/client_secret to the redirect target.
 func TestTokenRequestDoesNotFollowRedirects(t *testing.T) {
+	t.Parallel()
 	var mu sync.Mutex
 	var leaked []string
 	srvB := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -619,6 +651,7 @@ func TestTokenRequestDoesNotFollowRedirects(t *testing.T) {
 
 // L6: NewClient refuses a non-https URL even if admission was bypassed.
 func TestNewClientRequiresHTTPS(t *testing.T) {
+	t.Parallel()
 	store := newStore(&esv1.VaultwardenProvider{URL: "http://vw.example.com"})
 	_, err := (&Provider{}).NewClient(context.Background(), store, nil, "default")
 	assert.Error(t, err)
@@ -633,6 +666,7 @@ func (s *idleSpyTransport) CloseIdleConnections() { s.closed = true }
 
 // Info: the transport honours proxy settings and Close releases idle connections.
 func TestHTTPClientHygiene(t *testing.T) {
+	t.Parallel()
 	store := newStore(&esv1.VaultwardenProvider{URL: "https://vw.example.com"})
 	sc, err := (&Provider{}).NewClient(context.Background(), store, nil, "default")
 	require.NoError(t, err)
@@ -646,4 +680,220 @@ func TestHTTPClientHygiene(t *testing.T) {
 	c.httpClient.Transport = spy
 	require.NoError(t, c.Close(context.Background()))
 	assert.True(t, spy.closed)
+}
+
+// personalNoteServer serves one personal SecureNote "db-password" = "personal-value".
+func personalNoteServer(t *testing.T) (*hostileServer, *httptest.Server) {
+	t.Helper()
+	k := newHostileKeys(t)
+	fv := &hostileServer{profile: k.personalProfile(), ciphers: []map[string]any{managedNote(t, k, "p1", "db-password", "personal-value")}}
+	srv := httptest.NewTLSServer(fv)
+	t.Cleanup(srv.Close)
+	return fv, srv
+}
+
+// M4a: N data[] entries in one reconcile cost one /api/sync, and a write
+// invalidates the memoised list.
+func TestCipherListMemoisedPerClient(t *testing.T) {
+	t.Parallel()
+	fv, srv := personalNoteServer(t)
+	c := newHostileClient(t, srv, esv1.VaultwardenProvider{})
+	for range 3 {
+		v, err := c.GetSecret(context.Background(), esv1.ExternalSecretDataRemoteRef{Key: "db-password"})
+		require.NoError(t, err)
+		assert.Equal(t, "personal-value", string(v))
+	}
+	assert.Equal(t, 1, fv.count("GET /api/sync"))
+
+	secret := &corev1.Secret{Data: map[string][]byte{"k": []byte("v")}}
+	require.NoError(t, c.PushSecret(context.Background(), secret, testPushData{secretKey: "k", remoteKey: "new"}))
+	syncs := fv.count("GET /api/sync")
+	_, err := c.GetSecret(context.Background(), esv1.ExternalSecretDataRemoteRef{Key: "db-password"})
+	require.NoError(t, err)
+	assert.Equal(t, syncs+1, fv.count("GET /api/sync"), "list not refreshed after a write")
+}
+
+// M4b: successive clients for the same store and credentials (one per
+// reconcile in ESO) reuse the login and unlocked keys.
+func TestSessionReusedAcrossClients(t *testing.T) {
+	t.Parallel()
+	fv, srv := personalNoteServer(t)
+	for range 3 {
+		c := newHostileClient(t, srv, esv1.VaultwardenProvider{})
+		v, err := c.GetSecret(context.Background(), esv1.ExternalSecretDataRemoteRef{Key: "db-password"})
+		require.NoError(t, err)
+		assert.Equal(t, "personal-value", string(v))
+		require.NoError(t, c.Close(context.Background()))
+	}
+	assert.Equal(t, 1, fv.count("POST /identity/connect/token"))
+	assert.Equal(t, 1, fv.count("GET /api/accounts/profile"))
+}
+
+// M4b: sessions are never shared across stores or credentials.
+func TestSessionNotSharedAcrossStoresOrCredentials(t *testing.T) {
+	t.Parallel()
+	fv, srv := personalNoteServer(t)
+	get := func(c *Client) {
+		t.Helper()
+		_, err := c.GetSecret(context.Background(), esv1.ExternalSecretDataRemoteRef{Key: "db-password"})
+		require.NoError(t, err)
+	}
+	base := newHostileClient(t, srv, esv1.VaultwardenProvider{})
+	get(base)
+
+	other := newHostileClient(t, srv, esv1.VaultwardenProvider{})
+	other.store.(*esv1.SecretStore).Name = "other-store"
+	get(other)
+	assert.Equal(t, 2, fv.count("POST /identity/connect/token"), "different store must log in separately")
+
+	otherNS := newHostileClient(t, srv, esv1.VaultwardenProvider{})
+	otherNS.store.(*esv1.SecretStore).Namespace = "other-ns"
+	get(otherNS)
+	assert.Equal(t, 3, fv.count("POST /identity/connect/token"), "same name in another namespace must log in separately")
+
+	rotated := newHostileClient(t, srv, esv1.VaultwardenProvider{})
+	creds := hostileCredsKube(t)
+	creds.Data["clientSecret"] = []byte("ROTATED")
+	require.NoError(t, rotated.crClient.Update(context.Background(), creds))
+	get(rotated)
+	assert.Equal(t, 4, fv.count("POST /identity/connect/token"), "rotated credentials must log in again")
+}
+
+// M4b/L5: concurrent clients sharing a session do not disturb each other,
+// including when one of them is closed (its keys zeroed) mid-flight.
+func TestSessionConcurrentUse(t *testing.T) {
+	t.Parallel()
+	_, srv := personalNoteServer(t)
+	var wg sync.WaitGroup
+	errs := make(chan error, 32)
+	for range 16 {
+		wg.Go(func() {
+			c := newHostileClient(t, srv, esv1.VaultwardenProvider{})
+			v, err := c.GetSecret(context.Background(), esv1.ExternalSecretDataRemoteRef{Key: "db-password"})
+			if err == nil && string(v) != "personal-value" {
+				err = fmt.Errorf("got %q", v)
+			}
+			errs <- err
+			errs <- c.Close(context.Background())
+		})
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		assert.NoError(t, err)
+	}
+}
+
+// L5: Close must not zero keys out from under an operation in flight on the
+// same client.
+func TestCloseWaitsForInFlightOperation(t *testing.T) {
+	t.Parallel()
+	k := newHostileKeys(t)
+	fv := &hostileServer{profile: k.personalProfile(), ciphers: []map[string]any{managedNote(t, k, "p1", "db-password", "personal-value")}}
+	arrived, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	fv.syncHook = func(w http.ResponseWriter, _ *http.Request) bool {
+		once.Do(func() { close(arrived) })
+		<-release
+		return false
+	}
+	srv := httptest.NewTLSServer(fv)
+	defer srv.Close()
+	c := newHostileClient(t, srv, esv1.VaultwardenProvider{})
+
+	type result struct {
+		v   []byte
+		err error
+	}
+	got := make(chan result, 1)
+	go func() {
+		v, err := c.GetSecret(context.Background(), esv1.ExternalSecretDataRemoteRef{Key: "db-password"})
+		got <- result{v, err}
+	}()
+	<-arrived
+	closed := make(chan error, 1)
+	go func() { closed <- c.Close(context.Background()) }()
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+
+	r := <-got
+	require.NoError(t, r.err)
+	assert.Equal(t, "personal-value", string(r.v))
+	require.NoError(t, <-closed)
+}
+
+// deviceIDServer records the DeviceIdentifier of each token request.
+func deviceIDServer(t *testing.T) (*[]string, *httptest.Server) {
+	t.Helper()
+	k := newHostileKeys(t)
+	fv := &hostileServer{profile: k.personalProfile()}
+	var mu sync.Mutex
+	ids := &[]string{}
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/identity/connect/token" {
+			_ = r.ParseForm()
+			mu.Lock()
+			*ids = append(*ids, r.PostForm.Get("DeviceIdentifier"))
+			mu.Unlock()
+		}
+		fv.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	return ids, srv
+}
+
+// M4c: the device identifier depends only on the store's identity: a
+// ClusterSecretStore is one device whichever namespace uses it.
+func TestDeviceIdentifierFromStoreIdentity(t *testing.T) {
+	t.Parallel()
+	ids, srv := deviceIDServer(t)
+	newCSSClient := func(ns string) *Client {
+		c := newHostileClient(t, srv, esv1.VaultwardenProvider{})
+		c.store = &esv1.ClusterSecretStore{Kind: esv1.ClusterSecretStoreKind, Name: "shared-vw",
+			Spec: esv1.SecretStoreSpec{Provider: &esv1.SecretStoreProvider{Vaultwarden: c.provider}}}
+		c.namespace = ns
+		// Give the second namespace its own credentials secret, with a
+		// different API key so it does not reuse the first login.
+		if ns != "default" {
+			creds := hostileCredsKube(t)
+			creds.Namespace = ns
+			creds.Data["clientSecret"] = []byte("team-b-client-secret")
+			require.NoError(t, c.crClient.Create(context.Background(), creds))
+		}
+		return c
+	}
+	for _, ns := range []string{"default", "team-b"} {
+		_, err := newCSSClient(ns).getToken(context.Background())
+		require.NoError(t, err)
+	}
+	ssClient := newHostileClient(t, srv, esv1.VaultwardenProvider{})
+	ssClient.store.(*esv1.SecretStore).Name = "shared-vw"
+	_, err := ssClient.getToken(context.Background())
+	require.NoError(t, err)
+
+	require.Len(t, *ids, 3)
+	assert.Equal(t, (*ids)[0], (*ids)[1], "ClusterSecretStore device ID must not depend on the requesting namespace")
+	assert.NotEqual(t, (*ids)[0], (*ids)[2], "a SecretStore is a different device from a same-named ClusterSecretStore")
+}
+
+// L5: the master key passed in, and the intermediates derived from it, are
+// zeroed; the returned user keys are independent copies.
+func TestUnlockUserKeyZeroesMasterKey(t *testing.T) {
+	t.Parallel()
+	k := newHostileKeys(t)
+	mk, err := testMasterKey()
+	require.NoError(t, err)
+	masterKey := bytes.Clone(mk)
+
+	enc, mac, err := unlockUserKey(masterKey, k.protectedUserKey)
+	require.NoError(t, err)
+	assert.Equal(t, make([]byte, len(masterKey)), masterKey, "master key not zeroed")
+	assert.Equal(t, k.userEnc, enc)
+	assert.Equal(t, k.userMac, mac)
+	assert.Equal(t, 32, cap(enc), "enc must not alias the decrypted buffer")
+
+	masterKey = bytes.Clone(mk)
+	_, _, err = unlockUserKey(masterKey, "2.bad|bad|bad")
+	require.Error(t, err)
+	assert.Equal(t, make([]byte, len(masterKey)), masterKey, "master key not zeroed on error")
 }

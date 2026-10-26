@@ -126,10 +126,7 @@ func newFakeVaultwarden(t *testing.T, scope esv1.VaultwardenProvider) (*fakeVaul
 	userEnc, userMac := make32(1), make32(33)
 	orgKey := append(make32(65), make32(97)...)
 
-	masterKey, err := crypto.DeriveKey(context.Background(), testPassword, testEmail, crypto.KdfTypePBKDF2, testKdfIterations, 0, 0)
-	require.NoError(t, err)
-	stretchedEnc, stretchedMac, err := crypto.StretchKey(masterKey)
-	require.NoError(t, err)
+	stretchedEnc, stretchedMac := testStretchedKeys(t)
 	protectedUserKey, err := crypto.Encrypt(append(append([]byte{}, userEnc...), userMac...), stretchedEnc, stretchedMac)
 	require.NoError(t, err)
 
