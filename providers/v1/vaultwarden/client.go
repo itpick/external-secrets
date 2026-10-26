@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"sync"
@@ -107,8 +108,43 @@ type cipherCreateBody struct {
 	Name           string         `json:"name"`
 	Notes          string         `json:"notes"`
 	SecureNote     *secureNoteObj `json:"secureNote,omitempty"`
+	Fields         []cipherField  `json:"fields"`
 	FolderID       any            `json:"folderId"`
 	OrganizationID any            `json:"organizationId"`
+}
+
+// managedFieldName / managedFieldValue form the custom field stamped on every
+// item the provider creates. PushSecret and DeleteSecret only modify existing
+// Secure Notes that carry it, so a name collision cannot clobber an item a
+// human created. Like every field it is encrypted with the item's key.
+const (
+	managedFieldName  = "external-secrets.io/managed"
+	managedFieldValue = "true"
+)
+
+// isManaged reports whether cipher is a Secure Note carrying the managed marker.
+func isManaged(cipher *vaultwardenCipher, tok *cachedToken) bool {
+	if cipher.Type != cipherTypeSecureNote {
+		return false
+	}
+	encKey, macKey := tok.keysFor(cipher)
+	for _, f := range cipher.Fields {
+		name, err := crypto.DecryptString(f.Name, encKey, macKey)
+		if err != nil || name != managedFieldName {
+			continue
+		}
+		val, err := crypto.DecryptString(f.Value, encKey, macKey)
+		if err == nil && val == managedFieldValue {
+			return true
+		}
+	}
+	return false
+}
+
+func errNotManaged(op, name string) error {
+	return fmt.Errorf("vaultwarden: refusing to %s item %q: it is not managed by external-secrets "+
+		"(only Secure Notes carrying the %q field are modified); rename or remove the existing item, or use another remote key",
+		op, name, managedFieldName)
 }
 
 type secureNoteObj struct {
@@ -447,6 +483,9 @@ func (c *Client) PushSecret(ctx context.Context, secret *corev1.Secret, data esv
 	if existing != nil && meta.MergePolicy == mergePolicyError {
 		return fmt.Errorf("vaultwarden: cipher %q already exists and mergePolicy is Error", cipherName)
 	}
+	if existing != nil && !isManaged(existing, tok) {
+		return errNotManaged("overwrite", cipherName)
+	}
 	return c.upsertCipher(ctx, tok.accessToken, existing, bodyBytes)
 }
 
@@ -486,11 +525,20 @@ func buildCipherBody(name, notes string, tok *cachedToken) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("vaultwarden: encrypting cipher notes: %w", err)
 	}
+	encMarkerName, err := crypto.EncryptString(managedFieldName, symEncKey, symMacKey)
+	if err != nil {
+		return nil, fmt.Errorf("vaultwarden: encrypting cipher field: %w", err)
+	}
+	encMarkerValue, err := crypto.EncryptString(managedFieldValue, symEncKey, symMacKey)
+	if err != nil {
+		return nil, fmt.Errorf("vaultwarden: encrypting cipher field: %w", err)
+	}
 	body := cipherCreateBody{
 		Type:       cipherTypeSecureNote,
 		Name:       encName,
 		Notes:      encNotes,
 		SecureNote: &secureNoteObj{Type: 0},
+		Fields:     []cipherField{{Name: encMarkerName, Value: encMarkerValue, Type: 0}},
 	}
 	if tok.orgID != "" {
 		body.OrganizationID = tok.orgID
@@ -506,15 +554,11 @@ func buildCipherBody(name, notes string, tok *cachedToken) ([]byte, error) {
 // API reference: https://bitwarden.com/help/vault-management-api/ and https://github.com/dani-garcia/vaultwarden/wiki
 func (c *Client) upsertCipher(ctx context.Context, accessToken string, existing *vaultwardenCipher, bodyBytes []byte) error {
 	base := strings.TrimRight(c.provider.URL, "/")
-	var method, url string
+	method, reqURL := http.MethodPost, base+"/api/ciphers"
 	if existing != nil {
-		method = http.MethodPut
-		url = fmt.Sprintf("%s/api/ciphers/%s", base, existing.ID)
-	} else {
-		method = http.MethodPost
-		url = base + "/api/ciphers"
+		method, reqURL = http.MethodPut, base+"/api/ciphers/"+url.PathEscape(existing.ID)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(bodyBytes))
+	req, err := http.NewRequestWithContext(ctx, method, reqURL, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return fmt.Errorf("vaultwarden: building cipher request: %w", err)
 	}
@@ -532,7 +576,9 @@ func (c *Client) upsertCipher(ctx context.Context, accessToken string, existing 
 	return nil
 }
 
-// DeleteSecret deletes the cipher matching the remote ref's key. Idempotent — returns nil if not found.
+// DeleteSecret moves the cipher matching the remote ref's key to the trash
+// (soft delete, recoverable by a human). It refuses items the provider did not
+// create. Idempotent — returns nil if not found.
 func (c *Client) DeleteSecret(ctx context.Context, remoteRef esv1.PushSecretRemoteRef) error {
 	tok, err := c.getToken(ctx)
 	if err != nil {
@@ -548,10 +594,13 @@ func (c *Client) DeleteSecret(ctx context.Context, remoteRef esv1.PushSecretRemo
 	if cipher == nil {
 		return nil
 	}
+	if !isManaged(cipher, tok) {
+		return errNotManaged("delete", remoteRef.GetRemoteKey())
+	}
 
 	base := strings.TrimRight(c.provider.URL, "/")
-	deleteURL := fmt.Sprintf("%s/api/ciphers/%s", base, cipher.ID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, deleteURL, http.NoBody)
+	deleteURL := base + "/api/ciphers/" + url.PathEscape(cipher.ID) + "/delete"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, deleteURL, http.NoBody)
 	if err != nil {
 		return fmt.Errorf("vaultwarden: building delete request: %w", err)
 	}
@@ -637,7 +686,7 @@ func decodeJSONLimited(r io.Reader, limit int64, v any) error {
 func findCipherByName(ciphers []vaultwardenCipher, target string, tok *cachedToken) (*vaultwardenCipher, error) {
 	c := findCipherByNameNoErr(ciphers, target, tok)
 	if c == nil {
-		return nil, fmt.Errorf("vaultwarden: secret %q not found", target)
+		return nil, fmt.Errorf("vaultwarden: secret %q not found: %w", target, esv1.NoSecretErr)
 	}
 	return c, nil
 }

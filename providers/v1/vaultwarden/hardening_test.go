@@ -447,3 +447,102 @@ func TestAuthBodySizeLimited(t *testing.T) {
 		})
 	}
 }
+
+const testManagedField = "external-secrets.io/managed"
+
+// managedNote returns a personal SecureNote cipher carrying the ESO marker field.
+func managedNote(t *testing.T, k hostileKeys, id, name, notes string) map[string]any {
+	return map[string]any{"id": id, "type": 2, "organizationId": nil, "deletedDate": nil,
+		"name": encS(t, name, k.userEnc, k.userMac), "notes": encS(t, notes, k.userEnc, k.userMac),
+		"fields": []map[string]any{{"name": encS(t, testManagedField, k.userEnc, k.userMac), "value": encS(t, "true", k.userEnc, k.userMac), "type": 0}}}
+}
+
+func hasManagedMarker(t *testing.T, body map[string]any, e, m []byte) bool {
+	t.Helper()
+	fields, _ := body["fields"].([]any)
+	for _, f := range fields {
+		fm, _ := f.(map[string]any)
+		name, err1 := crypto.DecryptString(fmt.Sprint(fm["name"]), e, m)
+		val, err2 := crypto.DecryptString(fmt.Sprint(fm["value"]), e, m)
+		if err1 == nil && err2 == nil && name == testManagedField && val == "true" {
+			return true
+		}
+	}
+	return false
+}
+
+// M1: PushSecret and DeleteSecret must not touch a same-named item that a
+// human created (a Login here), and must not hard-delete anything.
+func TestPushAndDeleteRefuseUnmanagedItems(t *testing.T) {
+	k := newHostileKeys(t)
+	humanLogin := map[string]any{"id": "human-login-1", "type": 1, "organizationId": nil, "deletedDate": nil,
+		"name":  encS(t, "prod-admin", k.userEnc, k.userMac),
+		"login": map[string]any{"username": encS(t, "root", k.userEnc, k.userMac), "password": encS(t, "hunter2", k.userEnc, k.userMac)}}
+	unmarkedNote := map[string]any{"id": "human-note-1", "type": 2, "organizationId": nil, "deletedDate": nil,
+		"name": encS(t, "runbook", k.userEnc, k.userMac), "notes": encS(t, "human text", k.userEnc, k.userMac)}
+	fv := &hostileServer{profile: k.personalProfile(), ciphers: []map[string]any{humanLogin, unmarkedNote}}
+	srv := httptest.NewTLSServer(fv)
+	defer srv.Close()
+	c := newHostileClient(t, srv, esv1.VaultwardenProvider{})
+
+	secret := &corev1.Secret{Data: map[string][]byte{"k": []byte("whatever")}}
+	for _, name := range []string{"prod-admin", "runbook"} {
+		err := c.PushSecret(context.Background(), secret, testPushData{secretKey: "k", remoteKey: name})
+		require.Error(t, err, name)
+		assert.Contains(t, err.Error(), "not managed by external-secrets")
+		err = c.DeleteSecret(context.Background(), testPushData{remoteKey: name})
+		require.Error(t, err, name)
+		assert.Contains(t, err.Error(), "not managed by external-secrets")
+	}
+	assert.Empty(t, fv.puts)
+	assert.Empty(t, fv.posted)
+	for _, r := range fv.requests() {
+		assert.False(t, strings.HasPrefix(r, http.MethodDelete), "unexpected %s", r)
+	}
+}
+
+// M1: items ESO creates carry the managed marker; ESO updates and soft-deletes
+// its own items, path-escaping the server-supplied ID.
+func TestPushAndDeleteManagedItems(t *testing.T) {
+	k := newHostileKeys(t)
+	const oddID = "a/../b?c"
+	fv := &hostileServer{profile: k.personalProfile(), ciphers: []map[string]any{managedNote(t, k, oddID, "app-db", "old")}}
+	srv := httptest.NewTLSServer(fv)
+	defer srv.Close()
+	c := newHostileClient(t, srv, esv1.VaultwardenProvider{})
+	secret := &corev1.Secret{Data: map[string][]byte{"k": []byte("new-value")}}
+
+	// Create.
+	require.NoError(t, c.PushSecret(context.Background(), secret, testPushData{secretKey: "k", remoteKey: "fresh"}))
+	require.Len(t, fv.posted, 1)
+	assert.True(t, hasManagedMarker(t, fv.posted[0], k.userEnc, k.userMac), "created item lacks the managed marker")
+
+	// Update keeps the marker and escapes the ID.
+	require.NoError(t, c.PushSecret(context.Background(), secret, testPushData{secretKey: "k", remoteKey: "app-db"}))
+	escaped := "a%2F..%2Fb%3Fc"
+	body, ok := fv.puts[escaped]
+	require.True(t, ok, "PUT paths: %v", fv.requests())
+	assert.True(t, hasManagedMarker(t, body, k.userEnc, k.userMac))
+
+	// Delete is a soft delete.
+	require.NoError(t, c.DeleteSecret(context.Background(), testPushData{remoteKey: "app-db"}))
+	assert.Contains(t, fv.requests(), http.MethodPut+" /api/ciphers/"+escaped+"/delete")
+	for _, r := range fv.requests() {
+		assert.False(t, strings.HasPrefix(r, http.MethodDelete), "unexpected hard delete %s", r)
+	}
+
+	// Deleting something that does not exist is a no-op.
+	require.NoError(t, c.DeleteSecret(context.Background(), testPushData{remoteKey: "missing"}))
+}
+
+// M1: a missing secret is reported as esv1.NoSecretErr.
+func TestGetSecretNotFoundIsNoSecretErr(t *testing.T) {
+	k := newHostileKeys(t)
+	srv := httptest.NewTLSServer(&hostileServer{profile: k.personalProfile()})
+	defer srv.Close()
+	c := newHostileClient(t, srv, esv1.VaultwardenProvider{})
+	_, err := c.GetSecret(context.Background(), esv1.ExternalSecretDataRemoteRef{Key: "missing"})
+	assert.ErrorIs(t, err, esv1.NoSecretErr)
+	_, err = c.GetSecretMap(context.Background(), esv1.ExternalSecretDataRemoteRef{Key: "missing"})
+	assert.ErrorIs(t, err, esv1.NoSecretErr)
+}
