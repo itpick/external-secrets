@@ -53,12 +53,8 @@ type vaultwardenTokenResponse struct {
 
 // vaultwardenProfile is the JSON response from /api/accounts/profile.
 type vaultwardenProfile struct {
-	Email          string `json:"email"` // lowercase in profile response
-	Key            string `json:"key"`   // lowercase
-	Kdf            int    `json:"kdf"`
-	KdfIterations  int    `json:"kdfIterations"`
-	KdfMemory      *int   `json:"kdfMemory"`
-	KdfParallelism *int   `json:"kdfParallelism"`
+	Email string `json:"email"` // lowercase in profile response
+	Key   string `json:"key"`   // lowercase
 
 	// Organizations the user belongs to, each with its member-wrapped org key.
 	Organizations []orgEntry `json:"organizations"`
@@ -175,7 +171,7 @@ func (c *Client) fetchToken(ctx context.Context, creds *credentials) (*vaultward
 	return &tokenResp, nil
 }
 
-// fetchProfile fetches the account profile to read the encrypted symmetric key and KDF params.
+// fetchProfile fetches the account profile to read the encrypted symmetric key.
 // Bitwarden/Vaultwarden accounts API: GET /api/accounts/profile
 // https://bitwarden.com/help/public-api/
 func (c *Client) fetchProfile(ctx context.Context, accessToken string) (*vaultwardenProfile, error) {
@@ -290,15 +286,16 @@ func (c *Client) authenticate(ctx context.Context, creds *credentials) (*cachedT
 		return nil, err
 	}
 
+	// The KDF parameters are only in the token response; the profile has none.
 	memVal, parVal := 0, 0
-	if profile.KdfMemory != nil {
-		memVal = *profile.KdfMemory
+	if tokenResp.KdfMemory != nil {
+		memVal = *tokenResp.KdfMemory
 	}
-	if profile.KdfParallelism != nil {
-		parVal = *profile.KdfParallelism
+	if tokenResp.KdfParallelism != nil {
+		parVal = *tokenResp.KdfParallelism
 	}
 
-	masterKey, err := crypto.DeriveKey(ctx, creds.masterPassword, profile.Email, profile.Kdf, profile.KdfIterations, memVal, parVal)
+	masterKey, err := crypto.DeriveKey(ctx, creds.masterPassword, profile.Email, tokenResp.Kdf, tokenResp.KdfIterations, memVal, parVal)
 	if err != nil {
 		return nil, fmt.Errorf("vaultwarden: deriving master key: %w", err)
 	}

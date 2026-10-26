@@ -50,6 +50,24 @@ import (
 	"github.com/external-secrets/external-secrets/providers/v1/vaultwarden/internal/crypto"
 )
 
+// splitKDF returns the token and profile responses a real Vaultwarden would
+// send for a test profile: KDF parameters travel in the token response
+// (PascalCase) and are absent from /api/accounts/profile. Tests keep using
+// profile["kdf*"] as the fixture knob.
+func splitKDF(profile map[string]any) (token, prof map[string]any) {
+	token = map[string]any{"access_token": "tok", "expires_in": 7200}
+	prof = map[string]any{}
+	names := map[string]string{"kdf": "Kdf", "kdfIterations": "KdfIterations", "kdfMemory": "KdfMemory", "kdfParallelism": "KdfParallelism"}
+	for k, v := range profile {
+		if tk, ok := names[k]; ok {
+			token[tk] = v
+			continue
+		}
+		prof[k] = v
+	}
+	return token, prof
+}
+
 // hostileServer is a controllable fake Vaultwarden that records what it is sent.
 type hostileServer struct {
 	mu       sync.Mutex
@@ -68,9 +86,11 @@ func (f *hostileServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	switch {
 	case r.Method == http.MethodPost && r.URL.Path == "/identity/connect/token":
-		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "tok", "expires_in": 7200})
+		token, _ := splitKDF(f.profile)
+		_ = json.NewEncoder(w).Encode(token)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/accounts/profile":
-		_ = json.NewEncoder(w).Encode(f.profile)
+		_, prof := splitKDF(f.profile)
+		_ = json.NewEncoder(w).Encode(prof)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/sync":
 		if f.syncHook != nil && f.syncHook(w, r) {
 			return
@@ -901,4 +921,31 @@ func TestUnlockUserKeyZeroesMasterKey(t *testing.T) {
 	_, _, err = unlockUserKey(masterKey, "2.bad|bad|bad")
 	require.Error(t, err)
 	assert.Equal(t, make([]byte, len(masterKey)), masterKey, "master key not zeroed on error")
+}
+
+// Vaultwarden (like Bitwarden) sends the KDF parameters only in the token
+// response; /api/accounts/profile has none. Reading them from the profile
+// yields kdfIterations=0, which the M3 bound rejects, so every real login
+// failed. Found against vault.grail.tiberius.com 2026-10-26.
+func TestKDFParamsComeFromTokenResponse(t *testing.T) {
+	t.Parallel()
+	k := newHostileKeys(t)
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/identity/connect/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"access_token": "tok", "expires_in": 7200, "Key": k.protectedUserKey,
+				"Kdf": 0, "KdfIterations": testKdfIterations, "KdfMemory": nil, "KdfParallelism": nil,
+			})
+		case "/api/accounts/profile":
+			_ = json.NewEncoder(w).Encode(map[string]any{"email": testEmail, "key": k.protectedUserKey, "organizations": []any{}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	c := newHostileClient(t, srv, esv1.VaultwardenProvider{})
+	_, err := c.getToken(context.Background())
+	require.NoError(t, err)
 }

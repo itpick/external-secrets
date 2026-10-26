@@ -92,9 +92,11 @@ func (f *fakeVaultwarden) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	switch {
 	case r.Method == http.MethodPost && r.URL.Path == "/identity/connect/token":
-		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "tok"})
+		token, _ := splitKDF(f.profile)
+		_ = json.NewEncoder(w).Encode(token)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/accounts/profile":
-		_ = json.NewEncoder(w).Encode(f.profile)
+		_, prof := splitKDF(f.profile)
+		_ = json.NewEncoder(w).Encode(prof)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/sync":
 		_ = json.NewEncoder(w).Encode(map[string]any{"ciphers": f.ciphers})
 	case r.Method == http.MethodPost && r.URL.Path == "/api/ciphers":
