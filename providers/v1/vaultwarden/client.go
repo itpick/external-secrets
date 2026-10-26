@@ -126,6 +126,8 @@ type cachedToken struct {
 	orgID     string
 	orgEncKey []byte
 	orgMacKey []byte
+	// orgKeyFingerprint is the SHA-256 of the 64-byte org key (not secret).
+	orgKeyFingerprint [32]byte
 }
 
 // keysFor returns the key pair that decrypts c: the org keys for a cipher owned

@@ -22,6 +22,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha1"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"testing"
@@ -77,12 +78,13 @@ func TestUnlockOrgKey(t *testing.T) {
 	_, err = rand.Read(orgKey)
 	require.NoError(t, err)
 
-	enc, mac, err := unlockOrgKey(wrapOrgKey(t, &priv.PublicKey, orgKey), priv)
+	enc, mac, fp, err := unlockOrgKey(wrapOrgKey(t, &priv.PublicKey, orgKey), priv)
 	require.NoError(t, err)
 	assert.Equal(t, orgKey[:32], enc)
 	assert.Equal(t, orgKey[32:], mac)
+	assert.Equal(t, sha256.Sum256(orgKey), fp)
 
-	_, _, err = unlockOrgKey(wrapOrgKey(t, &priv.PublicKey, make([]byte, 32)), priv)
+	_, _, _, err = unlockOrgKey(wrapOrgKey(t, &priv.PublicKey, make([]byte, 32)), priv)
 	assert.ErrorContains(t, err, "unexpected length")
 }
 

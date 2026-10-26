@@ -9376,6 +9376,10 @@ spec:
                             operates on the user's personal vault only.
                           format: uuid
                           type: string
+                        organizationKeyFingerprint:
+                          description: "OrganizationKeyFingerprint pins the organization's symmetric key: the\nlowercase or uppercase hex SHA-256 of the 64-byte unwrapped organization\nkey. The organization key reaches the provider wrapped with the user's\nRSA public key, so a malicious or compromised server can substitute a\nkey it knows; when this field is set, the provider refuses to read or\nwrite organization items unless the unwrapped key matches.\nOnly meaningful together with OrganizationID or OrganizationName.\n\nObtain it once, from a trusted network path, with:\n\n\tVW_URL=https://vault.example.com VW_CLIENT_ID=user.xxx VW_CLIENT_SECRET=... \\\n\tVW_MASTER_PASSWORD=... VW_ORGANIZATION_ID=<uuid> \\\n\tgo run -tags vaultwarden ./providers/v1/vaultwarden/cmd/vw-org-fingerprint\n\nand re-pin it if the organization key is ever rotated."
+                          pattern: ^[0-9a-fA-F]{64}$
+                          type: string
                         organizationName:
                           description: |-
                             OrganizationName, if set, scopes this store to a single Vaultwarden
@@ -23211,6 +23215,10 @@ spec:
                             When both OrganizationID and OrganizationName are empty, the store
                             operates on the user's personal vault only.
                           format: uuid
+                          type: string
+                        organizationKeyFingerprint:
+                          description: "OrganizationKeyFingerprint pins the organization's symmetric key: the\nlowercase or uppercase hex SHA-256 of the 64-byte unwrapped organization\nkey. The organization key reaches the provider wrapped with the user's\nRSA public key, so a malicious or compromised server can substitute a\nkey it knows; when this field is set, the provider refuses to read or\nwrite organization items unless the unwrapped key matches.\nOnly meaningful together with OrganizationID or OrganizationName.\n\nObtain it once, from a trusted network path, with:\n\n\tVW_URL=https://vault.example.com VW_CLIENT_ID=user.xxx VW_CLIENT_SECRET=... \\\n\tVW_MASTER_PASSWORD=... VW_ORGANIZATION_ID=<uuid> \\\n\tgo run -tags vaultwarden ./providers/v1/vaultwarden/cmd/vw-org-fingerprint\n\nand re-pin it if the organization key is ever rotated."
+                          pattern: ^[0-9a-fA-F]{64}$
                           type: string
                         organizationName:
                           description: |-

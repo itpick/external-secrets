@@ -21,8 +21,10 @@ package vaultwarden
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -102,7 +104,20 @@ func (p *Provider) ValidateStore(store esv1.GenericStore) (admission.Warnings, e
 	if vw.OrganizationID != "" && vw.OrganizationName != "" {
 		return nil, errors.New("vaultwarden: organizationId and organizationName are mutually exclusive; set at most one")
 	}
-	return nil, nil
+	orgScoped := vw.OrganizationID != "" || vw.OrganizationName != ""
+	var warnings admission.Warnings
+	switch {
+	case vw.OrganizationKeyFingerprint != "" && !orgScoped:
+		return nil, errors.New("vaultwarden: organizationKeyFingerprint requires organizationId or organizationName")
+	case vw.OrganizationKeyFingerprint != "":
+		if b, err := hex.DecodeString(vw.OrganizationKeyFingerprint); err != nil || len(b) != sha256.Size {
+			return nil, errors.New("vaultwarden: organizationKeyFingerprint must be 64 hex characters (SHA-256)")
+		}
+	case orgScoped:
+		warnings = append(warnings, "vaultwarden: organization-scoped store has no organizationKeyFingerprint; "+
+			"the organization key delivered by the server is not verified")
+	}
+	return warnings, nil
 }
 
 func NewProvider() esv1.Provider {

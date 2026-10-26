@@ -21,6 +21,9 @@ package vaultwarden
 import (
 	"context"
 	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -107,26 +110,39 @@ func (c *Client) resolveSecretKeyRef(ctx context.Context, sel esmeta.SecretKeySe
 	return resolvers.SecretKeyRef(ctx, c.crClient, storeKind, c.namespace, &sel)
 }
 
-// fetchToken authenticates via OAuth2 client credentials.
-// Bitwarden/Vaultwarden identity API: POST /identity/connect/token
-// https://bitwarden.com/help/public-api/#authentication
-func (c *Client) fetchToken(ctx context.Context) (*vaultwardenTokenResponse, error) {
-	secretRef := c.provider.Auth.SecretRef
+// credentials are the three values a store needs to unlock a vault.
+type credentials struct {
+	clientID       string
+	clientSecret   string
+	masterPassword string
+}
 
+// resolveCredentials reads the store's API key and master password from Kubernetes.
+func (c *Client) resolveCredentials(ctx context.Context) (*credentials, error) {
+	secretRef := c.provider.Auth.SecretRef
 	clientID, err := c.resolveSecretKeyRef(ctx, secretRef.ClientID)
 	if err != nil {
 		return nil, fmt.Errorf("vaultwarden: reading clientID: %w", err)
 	}
-
 	clientSecret, err := c.resolveSecretKeyRef(ctx, secretRef.ClientSecret)
 	if err != nil {
 		return nil, fmt.Errorf("vaultwarden: reading clientSecret: %w", err)
 	}
+	masterPassword, err := c.resolveSecretKeyRef(ctx, secretRef.MasterPassword)
+	if err != nil {
+		return nil, fmt.Errorf("vaultwarden: reading masterPassword: %w", err)
+	}
+	return &credentials{clientID: clientID, clientSecret: clientSecret, masterPassword: masterPassword}, nil
+}
 
+// fetchToken authenticates via OAuth2 client credentials.
+// Bitwarden/Vaultwarden identity API: POST /identity/connect/token
+// https://bitwarden.com/help/public-api/#authentication
+func (c *Client) fetchToken(ctx context.Context, creds *credentials) (*vaultwardenTokenResponse, error) {
 	form := url.Values{}
 	form.Set("grant_type", "client_credentials")
-	form.Set("client_id", clientID)
-	form.Set("client_secret", clientSecret)
+	form.Set("client_id", creds.clientID)
+	form.Set("client_secret", creds.clientSecret)
 	form.Set("scope", "api")
 	form.Set("DeviceIdentifier", uuid.NewSHA1(uuid.NameSpaceURL, []byte(c.namespace+"/"+c.store.GetName())).String())
 	form.Set("DeviceType", "21")
@@ -196,18 +212,31 @@ func (c *Client) getToken(ctx context.Context) (*cachedToken, error) {
 	}
 	c.mu.Unlock()
 
-	tokenResp, err := c.fetchToken(ctx)
+	creds, err := c.resolveCredentials(ctx)
+	if err != nil {
+		return nil, err
+	}
+	t, err := c.authenticate(ctx, creds)
+	if err != nil {
+		return nil, err
+	}
+
+	c.mu.Lock()
+	c.cache = t
+	c.mu.Unlock()
+	return t, nil
+}
+
+// authenticate logs in with creds, unlocks the user key and, for org-scoped
+// stores, the organization key.
+func (c *Client) authenticate(ctx context.Context, creds *credentials) (*cachedToken, error) {
+	tokenResp, err := c.fetchToken(ctx, creds)
 	if err != nil {
 		return nil, err
 	}
 	profile, err := c.fetchProfile(ctx, tokenResp.AccessToken)
 	if err != nil {
 		return nil, err
-	}
-
-	masterPassword, err := c.resolveSecretKeyRef(ctx, c.provider.Auth.SecretRef.MasterPassword)
-	if err != nil {
-		return nil, fmt.Errorf("vaultwarden: reading masterPassword: %w", err)
 	}
 
 	memVal, parVal := 0, 0
@@ -218,7 +247,7 @@ func (c *Client) getToken(ctx context.Context) (*cachedToken, error) {
 		parVal = *profile.KdfParallelism
 	}
 
-	masterKey, err := crypto.DeriveKey(masterPassword, profile.Email, profile.Kdf, profile.KdfIterations, memVal, parVal)
+	masterKey, err := crypto.DeriveKey(creds.masterPassword, profile.Email, profile.Kdf, profile.KdfIterations, memVal, parVal)
 	if err != nil {
 		return nil, fmt.Errorf("vaultwarden: deriving master key: %w", err)
 	}
@@ -247,12 +276,9 @@ func (c *Client) getToken(ctx context.Context) (*cachedToken, error) {
 		expiresAt:   time.Now().Add(5 * time.Minute),
 	}
 	if err := c.unlockOrgScope(profile, t); err != nil {
+		t.invalidate()
 		return nil, err
 	}
-
-	c.mu.Lock()
-	c.cache = t
-	c.mu.Unlock()
 	return t, nil
 }
 
@@ -291,33 +317,61 @@ func (c *Client) unlockOrgScope(profile *vaultwardenProfile, t *cachedToken) err
 	if err != nil {
 		return fmt.Errorf("vaultwarden: %w", err)
 	}
-	orgEnc, orgMac, err := unlockOrgKey(wrappedKey, rsaPriv)
+	orgEnc, orgMac, fingerprint, err := unlockOrgKey(wrappedKey, rsaPriv)
 	if err != nil {
+		return err
+	}
+	if err := verifyOrgKeyFingerprint(c.provider.OrganizationKeyFingerprint, fingerprint); err != nil {
+		zeroBytes(orgEnc)
+		zeroBytes(orgMac)
 		return err
 	}
 	t.orgID = orgID
 	t.orgEncKey = orgEnc
 	t.orgMacKey = orgMac
+	t.orgKeyFingerprint = fingerprint
 	return nil
 }
 
 // unlockOrgKey unwraps a type-4 org key with the user's RSA private key and
-// splits the 64-byte plaintext into enc and mac keys. The intermediate
-// plaintext is zeroed before returning.
-func unlockOrgKey(wrappedKey string, priv *rsa.PrivateKey) (orgEnc, orgMac []byte, err error) {
+// splits the 64-byte plaintext into enc and mac keys. It also returns the
+// SHA-256 fingerprint of the 64-byte key. The intermediate plaintext is zeroed
+// before returning.
+func unlockOrgKey(wrappedKey string, priv *rsa.PrivateKey) (orgEnc, orgMac []byte, fingerprint [sha256.Size]byte, err error) {
 	plain, err := crypto.DecryptRSAOAEP(wrappedKey, priv)
 	if err != nil {
-		return nil, nil, fmt.Errorf("vaultwarden: unwrapping organization key: %w", err)
+		return nil, nil, fingerprint, fmt.Errorf("vaultwarden: unwrapping organization key: %w", err)
 	}
 	defer zeroBytes(plain)
 	if len(plain) != 64 {
-		return nil, nil, fmt.Errorf("vaultwarden: organization key has unexpected length %d", len(plain))
+		return nil, nil, fingerprint, fmt.Errorf("vaultwarden: organization key has unexpected length %d", len(plain))
 	}
+	fingerprint = sha256.Sum256(plain)
 	orgEnc = make([]byte, 32)
 	orgMac = make([]byte, 32)
 	copy(orgEnc, plain[:32])
 	copy(orgMac, plain[32:])
-	return orgEnc, orgMac, nil
+	return orgEnc, orgMac, fingerprint, nil
+}
+
+// verifyOrgKeyFingerprint fails closed when the store pins an organization key
+// fingerprint (hex SHA-256 of the 64-byte org key) and the unwrapped key does
+// not match it. The org key is delivered RSA-wrapped to the user's public key,
+// which the server knows, so without a pin a hostile server can substitute a
+// key of its choosing. An empty pin disables the check.
+func verifyOrgKeyFingerprint(pinned string, got [sha256.Size]byte) error {
+	if pinned == "" {
+		return nil
+	}
+	want, err := hex.DecodeString(strings.TrimSpace(pinned))
+	if err != nil || len(want) != sha256.Size {
+		return errors.New("vaultwarden: organizationKeyFingerprint must be 64 hex characters (SHA-256)")
+	}
+	if subtle.ConstantTimeCompare(want, got[:]) != 1 {
+		return errors.New("vaultwarden: organization key does not match organizationKeyFingerprint; " +
+			"refusing to use it (the server may have substituted the key, or the organization key was rotated)")
+	}
+	return nil
 }
 
 func zeroBytes(b []byte) {

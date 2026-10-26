@@ -40,6 +40,24 @@ type VaultwardenProvider struct {
 	// more than one of the user's organizations match the name.
 	// +optional
 	OrganizationName string `json:"organizationName,omitempty"`
+	// OrganizationKeyFingerprint pins the organization's symmetric key: the
+	// lowercase or uppercase hex SHA-256 of the 64-byte unwrapped organization
+	// key. The organization key reaches the provider wrapped with the user's
+	// RSA public key, so a malicious or compromised server can substitute a
+	// key it knows; when this field is set, the provider refuses to read or
+	// write organization items unless the unwrapped key matches.
+	// Only meaningful together with OrganizationID or OrganizationName.
+	//
+	// Obtain it once, from a trusted network path, with:
+	//
+	//	VW_URL=https://vault.example.com VW_CLIENT_ID=user.xxx VW_CLIENT_SECRET=... \
+	//	VW_MASTER_PASSWORD=... VW_ORGANIZATION_ID=<uuid> \
+	//	go run -tags vaultwarden ./providers/v1/vaultwarden/cmd/vw-org-fingerprint
+	//
+	// and re-pin it if the organization key is ever rotated.
+	// +optional
+	// +kubebuilder:validation:Pattern:=`^[0-9a-fA-F]{64}$`
+	OrganizationKeyFingerprint string `json:"organizationKeyFingerprint,omitempty"`
 	// CABundle is a base64-encoded PEM CA bundle used to validate the Vaultwarden server certificate.
 	// If omitted, the system CA pool is used.
 	// +optional
